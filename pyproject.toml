@@ -1,0 +1,180 @@
+[project]
+name = "prediction-market-system"
+version = "0.1.0"
+description = "Quantitative trading system for prediction markets (Kalshi + Polymarket)"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+
+authors = [{ name = "Nacho" }]
+
+keywords = [
+    "prediction-markets",
+    "algorithmic-trading",
+    "market-making",
+    "kalshi",
+    "polymarket",
+    "quantitative-finance",
+]
+
+# ---------------------------------------------------------------------------
+# Runtime dependencies — grouped by layer
+# ---------------------------------------------------------------------------
+dependencies = [
+    # --- Fase 1: Connectors & I/O ---
+    "aiohttp>=3.10",           # async HTTP client (REST calls)
+    "websockets>=13.0",        # async WebSocket streaming
+    "pydantic>=2.7",           # data validation & settings
+    "pydantic-settings>=2.3",  # .env → config objects
+    "python-dotenv>=1.0",      # load .env files
+
+    # --- Fase 1: Storage ---
+    "duckdb>=1.0",             # embedded OLAP database
+    "pyarrow>=16.0",           # Parquet read/write
+    "pandas>=2.2",             # DataFrames (glue layer)
+
+    # --- Fase 1: Features / numerics ---
+    "numpy>=2.0",              # core numerics
+    "scipy>=1.13",             # stats, optimization (usado en GLFT)
+
+    # --- Fase 2: Models & signals ---
+    "scikit-learn>=1.5",       # isotonic regression, calibration
+    "lightgbm>=4.4",           # ensemble signal model
+    "pymc>=5.16",              # Bayesian updating (opcional, pesado)
+
+    # --- Fase 3-4: Strategies & execution ---
+    "py-clob-client>=0.18",    # Polymarket CLOB official Python client
+    "eth-account>=0.13",       # EIP-712 signing for Polymarket orders
+    "web3>=7.0",               # Polygon RPC interaction
+
+    # --- Observability ---
+    "structlog>=24.0",         # structured JSON logging
+    "rich>=13.0",              # pretty terminal output
+]
+
+# ---------------------------------------------------------------------------
+# Optional dependency groups
+# uv sync --extra dashboard
+# uv sync --extra research
+# uv sync --extra dev
+# uv sync --extra all
+# ---------------------------------------------------------------------------
+[project.optional-dependencies]
+
+dashboard = [
+    "streamlit>=1.36",
+    "plotly>=5.22",
+]
+
+research = [
+    "jupyter>=1.0",
+    "jupyterlab>=4.2",
+    "matplotlib>=3.9",
+    "seaborn>=0.13",
+    "ipywidgets>=8.1",
+]
+
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "pre-commit>=3.7",
+    "ipython>=8.25",
+]
+
+all = [
+    "prediction-market-system[dashboard,research,dev]",
+]
+
+# ---------------------------------------------------------------------------
+# Entrypoints CLI
+# ---------------------------------------------------------------------------
+[project.scripts]
+pms-ingest = "prediction_market_system.main:run_ingestion"
+pms-paper  = "prediction_market_system.main:run_paper_trading"
+pms-dash   = "prediction_market_system.dashboard.app:main"
+
+# ---------------------------------------------------------------------------
+# Build backend
+# ---------------------------------------------------------------------------
+[build-system]
+requires      = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["prediction_market_system"]
+
+# ---------------------------------------------------------------------------
+# uv — dev dependencies declaradas aquí además de en optional-dependencies
+# para que `uv sync` las instale automáticamente en entorno de desarrollo
+# ---------------------------------------------------------------------------
+[dependency-groups]
+dev = [
+    "pytest>=8.2",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "pre-commit>=3.7",
+    "ipython>=8.25",
+]
+
+# ---------------------------------------------------------------------------
+# Ruff — linter + formatter (reemplaza black + flake8 + isort)
+# ---------------------------------------------------------------------------
+[tool.ruff]
+target-version = "py312"
+line-length    = 100
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "UP",  # pyupgrade
+    "ANN", # flake8-annotations (type hints obligatorios)
+]
+ignore = [
+    "ANN101",  # missing type for self
+    "ANN102",  # missing type for cls
+]
+
+[tool.ruff.lint.per-file-ignores]
+"research/*" = ["ANN", "E501"]  # más permisivo en notebooks
+"tests/*"    = ["ANN"]
+
+# ---------------------------------------------------------------------------
+# Mypy
+# ---------------------------------------------------------------------------
+[tool.mypy]
+python_version         = "3.12"
+strict                 = true
+ignore_missing_imports = true
+exclude                = ["research/", "tests/"]
+
+# ---------------------------------------------------------------------------
+# Pytest
+# ---------------------------------------------------------------------------
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths    = ["tests"]
+addopts      = "--cov=prediction_market_system --cov-report=term-missing -q"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
+
+# ---------------------------------------------------------------------------
+# Coverage
+# ---------------------------------------------------------------------------
+[tool.coverage.run]
+source = ["prediction_market_system"]
+omit   = ["research/*", "tests/*", "*/migrations/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+fail_under   = 60

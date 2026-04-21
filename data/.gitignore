@@ -1,0 +1,7 @@
+# Ignore all data files, keep directory structure
+*
+!.gitignore
+!duckdb/
+!parquet/
+!parquet/ticks/
+!parquet/orderbooks/
