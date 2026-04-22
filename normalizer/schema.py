@@ -22,6 +22,9 @@ class Venue(str, Enum):
     POLYMARKET = "polymarket"
     MANIFOLD = "manifold"
 
+    def __str__(self) -> str:
+        return self.value
+
 
 class MarketStatus(str, Enum):
     OPEN = "open"
@@ -70,6 +73,15 @@ class Resolution:
     resolution_date: datetime
     resolved_value: float | None = None
 
+    def is_resolved(self) -> bool:
+        return self.resolved_value is not None
+
+    def resolved_yes(self) -> bool | None:
+        if self.resolved_value is None:
+            return None
+        return self.resolved_value == 1.0
+
+    @property
     def tau(self) -> float:
         now = utcnow()
         if now >= self.resolution_date:
@@ -119,6 +131,15 @@ class OrderBook:
     def bid_depth(self, levels: int = 5) -> float:  # ← dentro
         return sum(lv.size for lv in self.bids[:levels])
 
+    def ask_depth(self, levels: int = 5) -> float:
+        return sum(lv.size for lv in self.asks[:levels])
+
+    @property
+    def spread(self) -> float | None:
+        if self.best_bid is None or self.best_ask is None:
+            return None
+        return float(self.best_ask - self.best_bid)
+
 
 @dataclass(frozen=True)
 class Tick:
@@ -131,8 +152,22 @@ class Tick:
     side: Side | None = None
 
     def __post_init__(self) -> None:
+        if not 0.0 <= self.yes_bid <= 1.0:
+            raise ValueError(f"yes_bid must be in [0,1], got {self.yes_bid}")
+        if not 0.0 <= self.yes_ask <= 1.0:
+            raise ValueError(f"yes_ask must be in [0,1], got {self.yes_ask}")
+        if self.yes_bid > self.yes_ask:
+            raise ValueError(f"yes_bid ({self.yes_bid}) > yes_ask ({self.yes_ask})")
         if self.tick_type == TickType.TRADE and self.side is None:
             raise ValueError("TRADE ticks must have a side")
+
+    @property
+    def mid(self) -> float:
+        return (self.yes_bid + self.yes_ask) / 2
+
+    @property
+    def spread(self) -> float:
+        return float(self.yes_ask - self.yes_bid)
 
 
 @dataclass(frozen=True)
