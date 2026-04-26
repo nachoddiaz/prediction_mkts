@@ -122,3 +122,47 @@ One row per tick, with features computed by `features/microstructure.py`. These 
 | `mu_hat` | `0.012` | Estimated directional signal |
 
 **Write frequency:** same as `ticks` — one feature row per tick.
+
+
+
+## System Architecture
+
+### Signal & Quoting Pipeline
+
+
+## System Architecture
+
+### Signal & Quoting Pipeline
+
+```text
+MarketDataReader
+      |
+      |-- features/microstructure.py  -->  OBI, sigma_B(p,tau), EWMA vol
+      |-- features/resolution.py      -->  tau, gamma_eff, Q_max_eff, regime
+                    |
+                    v
+      strategies/market_making/params.py
+            kappa, A (GLFT)  .  phi, eta, rho, w_i (Cartea-Jaimungal)
+                    |
+          +---------+---------+
+          v                   v
+   glft.py            cartea_jaimungal.py
+   r_a, r_b (GLFT)    r_a, r_b (CJ + signal mu_hat)
+          +---------+---------+
+                    |
+                    v
+          execution/router.py
+              send orders
+```
+
+### Model Hierarchy
+
+| Layer | File | Output |
+|-------|------|--------|
+| Market data | `storage/reader.py` | ticks, orderbooks |
+| Microstructure | `features/microstructure.py` | OBI, sigma_B, EWMA |
+| Resolution | `features/resolution.py` | tau, regime, gamma_eff |
+| Calibration | `strategies/market_making/params.py` | kappa, A, phi, eta, rho |
+| Quoting GLFT | `strategies/market_making/glft.py` | r_a, r_b |
+| Quoting CJ | `strategies/market_making/cartea_jaimungal.py` | r_a, r_b + signal |
+| Execution | `execution/router.py` | orders |
