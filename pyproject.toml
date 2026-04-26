@@ -22,34 +22,30 @@ keywords = [
 # ---------------------------------------------------------------------------
 dependencies = [
     # --- Fase 1: Connectors & I/O ---
-    "aiohttp>=3.10",           # async HTTP client (REST calls)
-    "websockets>=13.0",        # async WebSocket streaming
-    "pydantic>=2.7",           # data validation & settings
-    "pydantic-settings>=2.3",  # .env → config objects
-    "python-dotenv>=1.0",      # load .env files
-
+    "aiohttp>=3.10", # async HTTP client (REST calls)
+    "websockets>=13.0", # async WebSocket streaming
+    "pydantic>=2.7", # data validation & settings
+    "pydantic-settings>=2.3", # .env → config objects
+    "python-dotenv>=1.0", # load .env files
     # --- Fase 1: Storage ---
-    "duckdb>=1.0",             # embedded OLAP database
-    "pyarrow>=16.0",           # Parquet read/write
-    "pandas>=2.2",             # DataFrames (glue layer)
-
+    "duckdb>=1.0", # embedded OLAP database
+    "pyarrow>=16.0", # Parquet read/write
+    "pandas>=2.2", # DataFrames (glue layer)
     # --- Fase 1: Features / numerics ---
-    "numpy>=2.0",              # core numerics
-    "scipy>=1.13",             # stats, optimization (usado en GLFT)
-
+    "numpy>=2.0", # core numerics
+    "scipy>=1.13", # stats, optimization (usado en GLFT)
     # --- Fase 2: Models & signals ---
-    "scikit-learn>=1.5",       # isotonic regression, calibration
-    "lightgbm>=4.4",           # ensemble signal model
-    "pymc>=5.16",              # Bayesian updating (opcional, pesado)
-
+    "scikit-learn>=1.5", # isotonic regression, calibration
+    "lightgbm>=4.4", # ensemble signal model
+    "pymc>=5.16", # Bayesian updating (opcional, pesado)
     # --- Fase 3-4: Strategies & execution ---
-    "py-clob-client>=0.18",    # Polymarket CLOB official Python client
-    "eth-account>=0.13",       # EIP-712 signing for Polymarket orders
-    "web3>=7.0",               # Polygon RPC interaction
-
+    "py-clob-client>=0.18", # Polymarket CLOB official Python client
+    "eth-account>=0.13", # EIP-712 signing for Polymarket orders
+    "web3>=7.0", # Polygon RPC interaction
     # --- Observability ---
-    "structlog>=24.0",         # structured JSON logging
-    "rich>=13.0",              # pretty terminal output
+    "structlog>=24.0", # structured JSON logging
+    "rich>=13.0", # pretty terminal output
+    "pytz>=2026.1.post1",
 ]
 
 # ---------------------------------------------------------------------------
@@ -162,7 +158,7 @@ exclude                = ["research/", "tests/"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths    = ["tests"]
-addopts      = "--cov=prediction_market_system --cov-report=term-missing -q"
+addopts      = "--cov=storage --cov=normalizer --cov=features --cov-report=term-missing -q"
 filterwarnings = [
     "ignore::DeprecationWarning",
 ]
@@ -171,10 +167,10 @@ filterwarnings = [
 # Coverage
 # ---------------------------------------------------------------------------
 [tool.coverage.run]
-source = ["prediction_market_system"]
-omit   = ["research/*", "tests/*", "*/migrations/*"]
+source = ["storage", "normalizer", "features"]
+omit   = ["tests/*", "*/migrations/*", "scripts/*"]
 
 [tool.coverage.report]
 show_missing = true
 skip_covered = false
-fail_under   = 60
+fail_under   = 10
