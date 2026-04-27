@@ -1,0 +1,36 @@
+# config/polymarket.yaml
+# ───────────────────────
+# Parámetros del modelo y riesgo para Polymarket.
+#
+# Diferencias clave respecto a Kalshi:
+#   - Liquidación on-chain en Polygon (~2s latencia)
+#   - Sin límites CFTC — más volumen en ciertos mercados
+#   - Mayor riesgo de contraparte (smart contracts) → q_max menor
+#   - κ típicamente mayor — CLOB más profundo
+
+name: polymarket
+
+active_categories:
+  - crypto
+  - politics
+
+max_markets: 30
+http_timeout: 15   # mayor timeout por latencia de Polygon
+
+risk:
+  # γ ligeramente mayor por riesgo de smart contract
+  gamma: 0.15
+  q_max: 5
+  max_daily_loss: 75.0
+  max_position_loss: 15.0
+
+model:
+  # κ típicamente mayor en Polymarket
+  kappa: 2.0
+  A: 0.08
+  phi: 1.2
+  eta: 0.06
+  rho: 0.12
+  w_obi: 1.0
+  w_news: 0.0
+  w_onchain: 0.0

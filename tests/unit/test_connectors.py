@@ -530,7 +530,7 @@ class TestManifoldConnector:
         connector = make_manifold_connector()
         connector._session = MockSession(
             {
-                "manifold.markets/api/v0/markets": [MANIFOLD_MARKET_RAW],
+                "api.manifold.markets/v0/search-markets": [MANIFOLD_MARKET_RAW],
             }
         )
 
@@ -547,7 +547,7 @@ class TestManifoldConnector:
         connector = make_manifold_connector()
         connector._session = MockSession(
             {
-                "manifold.markets/api/v0/markets": [raw_sin_close],
+                "api.manifold.markets/v0/search-markets": [raw_sin_close],
             }
         )
 
@@ -563,7 +563,7 @@ class TestManifoldConnector:
         connector = make_manifold_connector()
         connector._session = MockSession(
             {
-                "manifold.markets/api/v0/market/": MANIFOLD_MARKET_RAW,
+                "api.manifold.markets/v0/market/": MANIFOLD_MARKET_RAW,
             }
         )
 
@@ -584,7 +584,7 @@ class TestManifoldConnector:
         connector = make_manifold_connector()
         connector._session = MockSession(
             {
-                "manifold.markets/api/v0/market/": MANIFOLD_MARKET_RAW,
+                "api.manifold.markets/v0/market/": MANIFOLD_MARKET_RAW,
             }
         )
 
@@ -603,7 +603,7 @@ class TestManifoldConnector:
         connector = make_manifold_connector()
         connector._session = MockSession(
             {
-                "manifold.markets/api/v0/market/": MANIFOLD_MARKET_RAW,
+                "api.manifold.markets/v0/market/": MANIFOLD_MARKET_RAW,
             }
         )
 

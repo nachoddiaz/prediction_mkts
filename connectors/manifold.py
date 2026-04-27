@@ -49,7 +49,7 @@ from normalizer.schema import (
 
 log = logging.getLogger(__name__)
 
-MANIFOLD_BASE = "https://manifold.markets/api/v0"
+MANIFOLD_BASE = "https://api.manifold.markets/v0"
 POLL_INTERVAL = 10  # segundos entre polls
 MARKET_LIMIT = 20  # mercados a fetchar
 
@@ -94,8 +94,9 @@ class ManifoldConnector(BaseConnector):
         equivalentes a los contratos binarios de Kalshi/Polymarket.
         """
         data = await self._get(
-            f"{MANIFOLD_BASE}/markets",
+            f"{MANIFOLD_BASE}/search-markets",
             params={
+                "term": "",
                 "limit": MARKET_LIMIT,
                 "sort": "liquidity",
                 "filter": "open",
@@ -244,7 +245,7 @@ class ManifoldConnector(BaseConnector):
         Manifold usa slugs como IDs (e.g. "will-btc-hit-150k-2026")
         en lugar de tickers o condition_ids.
         """
-        slug = raw.get("slug") or raw.get("id")
+        slug = raw.get("id") or raw.get("slug")
         if not slug:
             return None
 
