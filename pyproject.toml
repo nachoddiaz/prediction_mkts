@@ -46,6 +46,7 @@ dependencies = [
     "structlog>=24.0", # structured JSON logging
     "rich>=13.0", # pretty terminal output
     "pytz>=2026.1.post1",
+    "cryptography>=47.0.0",
 ]
 
 # ---------------------------------------------------------------------------
@@ -161,6 +162,9 @@ testpaths    = ["tests"]
 addopts      = "--cov=storage --cov=normalizer --cov=features --cov-report=term-missing -q"
 filterwarnings = [
     "ignore::DeprecationWarning",
+]
+markers = [
+    "live: tests that make real HTTP calls (deselect with -m 'not live')",
 ]
 
 # ---------------------------------------------------------------------------

@@ -71,10 +71,12 @@ def _parse_clob_token_ids(raw: dict[str, Any]) -> tuple[str, str] | None:
     return None
 
 
-def _infer_category_poly(tags: list[str]) -> MarketCategory:
-    for tag in [t.lower() for t in tags]:
-        if tag in _POLY_TAG_MAP:
-            return _POLY_TAG_MAP[tag]
+def _infer_category_poly(tags: list[str] | list[dict]) -> MarketCategory:
+    for tag in tags:
+        # Handle both string tags and dict tags with 'label' key
+        tag_str = tag.lower() if isinstance(tag, str) else tag.get("label", "").lower()
+        if tag_str in _POLY_TAG_MAP:
+            return _POLY_TAG_MAP[tag_str]
     return MarketCategory.OTHER
 
 
