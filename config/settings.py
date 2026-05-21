@@ -194,21 +194,21 @@ def load_venue_config(venue: str) -> VenueConfig:
     last_cal = datetime.fromisoformat(last_cal_str) if last_cal_str else None
 
     risk = RiskParams(
-        gamma=raw_risk["gamma"],
-        q_max=raw_risk["q_max"],
-        max_daily_loss=raw_risk["max_daily_loss"],
-        max_position_loss=raw_risk["max_position_loss"],
+        gamma=raw_risk.get("gamma_I", raw_risk.get("gamma", 0.1)),
+        q_max=raw_risk.get("q_max", 10),
+        max_daily_loss=raw_risk.get("max_daily_loss", 100.0),
+        max_position_loss=raw_risk.get("max_position_loss", 20.0),
     )
 
     model = ModelParams(
-        kappa=raw_model["kappa"],
-        A=raw_model["A"],
-        phi=raw_model["phi"],
-        eta=raw_model["eta"],
-        rho=raw_model["rho"],
-        w_obi=raw_model["w_obi"],
-        w_news=raw_model["w_news"],
-        w_onchain=raw_model["w_onchain"],
+        kappa=raw_model.get("kappa_p", raw_model.get("kappa", 1.5)),
+        A=raw_model.get("A", 0.1),
+        phi=raw_model.get("phi", 1.0),
+        eta=raw_model.get("eta", 0.05),
+        rho=raw_model.get("rho", 0.1),
+        w_obi=raw_model.get("w_obi", 1.0),
+        w_news=raw_model.get("w_news", 0.0),
+        w_onchain=raw_model.get("w_onchain", 0.0),
         last_calibrated=last_cal,
     )
 

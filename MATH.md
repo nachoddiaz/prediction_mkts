@@ -10,38 +10,48 @@
 
 ## Notation Reference
 
-| Symbol | Meaning |
-|--------|---------|
-| $S_t$ | Mid-price of the contract at time $t$ |
-| $p_t$ | Implied probability $\in (0,1)$ — for binary contracts $S_t \equiv p_t$ |
-| $T$ | Resolution time (fixed) |
-| $\tau = T - t$ | Time remaining to resolution |
-| $q_t$ | Inventory: net position held by the market maker (signed) |
-| $Q$ | Maximum inventory limit $\vert q \vert \leq Q$ |
-| $\delta^b, \delta^a$ | Bid and ask half-spreads around mid-price |
-| $r^b = p_t - \delta^b$ | Bid quote |
-| $r^a = p_t + \delta^a$ | Ask quote |
-| $\lambda^b(\delta), \lambda^a(\delta)$ | Arrival intensities of buy/sell market orders |
-| $\kappa$ | Order book depth parameter (decay of arrival intensity) |
-| $A$ | Baseline order arrival rate |
-| $\gamma$ | Risk aversion coefficient of the market maker |
-| $\sigma$ | Volatility of the mid-price process |
-| $\sigma_B(p,\tau)$ | Bernoulli volatility surface (defined in §5) |
-| $W_t$ | Standard Brownian motion (price noise) |
-| $B_t$ | Standard Brownian motion (signal noise) |
-| $N_t^b, N_t^a$ | Counting processes for buyer/seller-initiated trades |
-| $X_t$ | Cash account of the market maker |
-| $V(t, p, q, x)$ | Value function of the MM stochastic control problem |
-| $\mu_t$ | Latent drift of the price process (OU) |
-| $\hat{\mu}_t$ | Estimated signal: $w_1\cdot\text{OBI}_t + w_2\cdot\text{News}_t + w_3\cdot\text{OnChain}_t$ |
-| $\phi$ | Mean-reversion speed of $\mu_t$ |
-| $\eta$ | Volatility of $\mu_t$ |
-| $\rho$ | Correlation: $d\langle W,B\rangle_t = \rho\,dt$ |
-| $\Pi$ | Arbitrage profit per unit: $p^P - p^K$ |
-| $C$ | Round-trip transaction cost |
+> **v2.1 corrections**: `σ_b` replaces `σ_B`; `γ_I` / `φ_K` replace single `γ`;
+> `κ_x` / `κ_p` replace single `κ`; `X_t = logit(p_t)` is the primary state variable.
+
+| Symbol | Meaning | Units |
+|--------|---------|-------|
+| $p_t \in (0,1)$ | Mid-quote / risk-neutral probability | dimensionless |
+| $X_t = \text{logit}(p_t)$ | Log-odds state variable | nats |
+| $\sigma(x) = (1+e^{-x})^{-1}$ | Inverse logit | — |
+| $\sigma'(x) = p(1-p)$ | First derivative of inverse logit | — |
+| $\sigma''(x) = p(1-p)(1-2p)$ | Second derivative | — |
+| $T$ | Resolution time (fixed) | — |
+| $\tau = T - t$ | Time remaining to resolution | seconds |
+| $q_t \in \mathbb{Z}$ | Inventory in contracts (signed) | shares |
+| $Q$ | Maximum inventory limit $\vert q \vert \leq Q$ | shares |
+| $\sigma_b(t, X)$ | Belief volatility (instantaneous, of log-odds) | $1/\sqrt{s}$ |
+| $\gamma_I$ | CARA inventory risk aversion | $1/\$$ |
+| $\varphi_K \in (0,1]$ | Kelly fractional multiplier | dimensionless |
+| $\kappa_x,\, \kappa_p$ | Fill-curve decay in logit / price space | dimensionless, $1/\$$ |
+| $A$ | Fill arrival rate at zero spread | $1/s$ |
+| $\varepsilon = p^{\mathbb{P}} - p^{\text{mkt}}$ | Edge (model minus market) | dimensionless |
+| $\delta^b, \delta^a$ | Bid and ask half-spreads | — |
+| $\lambda^b(\delta), \lambda^a(\delta)$ | Arrival intensities of market orders | $1/s$ |
+| $W_t$ | $\mathbb{Q}$-Brownian motion (log-odds noise) | — |
+| $B_t$ | $\mathbb{P}$-Brownian motion (signal noise) | — |
+| $\mu_t$ | Latent alpha-drift under $\mathbb{P}$ (OU) | — |
+| $\hat{\mu}_t$ | Estimated signal: $\sum_k w_k s_{k,t}$ | — |
+| $\phi$ | Mean-reversion speed of $\mu_t$ | $1/s$ |
+| $\eta$ | Volatility of $\mu_t$ | — |
+| $\rho_\mu \in (0,1]$ | Measure-change discount on alpha | dimensionless |
+| $\rho$ | Correlation $d\langle W,B\rangle_t = \rho\,dt$ | dimensionless |
+| $r$ | Oracle reversal probability | dimensionless |
+| $b_U$ | USDC–USD basis (Polymarket leg) | dimensionless |
+| $f_t$ | Proportional taker fee | dimensionless |
+| $\rho_c$ | Continuous capital cost rate | $1/\text{year}$ |
 
 All prices are expressed as probabilities $\in [0,1]$. Kalshi quotes in cents
 are divided by 100; Polymarket USDC fractional amounts are used directly.
+
+**Why $X_t$ and not $p_t$?** The logit map transports the boundary to $\pm\infty$
+where standard semimartingale tools (Itô–Lévy) apply, while preserving $p \in (0,1)$
+automatically. AS, GLFT and CJ all operate in their canonical $\mathbb{R}$-valued
+state space on $X_t$.
 
 ---
 
@@ -64,58 +74,49 @@ Three types of agents:
 Let $\mu \in (0,1)$ be the prior probability that the contract resolves YES
 ($V=1$). Let $\alpha \in [0,1]$ be the fraction of order flow that is informed.
 
-### 1.3 Order Arrival Probabilities
+### 1.3 Asymmetric Likelihood Ratios
 
-An informed trader **buys** only if $V=1$ and **sells** only if $V=0$. A
-noise trader buys or sells with equal probability $\frac{1}{2}$:
+> **v2.1 correction (defect K):** A single $\alpha$ implicitly assumed
+> sensitivity = specificity. Empirically, informed flow is asymmetric on the
+> long-tail side. We now use separate LR+ and LR–.
 
-$$\Pr(\text{buy} \mid V=1) = \alpha\cdot 1 + (1-\alpha)\cdot\tfrac{1}{2} = \tfrac{1+\alpha}{2}$$
+For a $\$1/\$0$ binary contract with true value $V \in \{0,1\}$:
 
-$$\Pr(\text{buy} \mid V=0) = \alpha\cdot 0 + (1-\alpha)\cdot\tfrac{1}{2} = \tfrac{1-\alpha}{2}$$
+$$\text{LR}_+ := \frac{\Pr(\text{buy}\mid V=1)}{\Pr(\text{buy}\mid V=0)}, \qquad
+\text{LR}_- := \frac{\Pr(\text{sell}\mid V=1)}{\Pr(\text{sell}\mid V=0)}$$
 
-By the law of total probability:
+### 1.4 Bayesian Posteriors in Log-Odds
 
-$$\Pr(\text{buy}) = \tfrac{1+\alpha}{2}\cdot\mu + \tfrac{1-\alpha}{2}\cdot(1-\mu)
-= \frac{1+\alpha(2\mu-1)}{2}$$
+In log-odds the Bayesian update is **additive**:
 
-### 1.4 Bayesian Posteriors
+$$X^{\text{buy}}_{t+} = X_t + \ln\text{LR}_+, \qquad X^{\text{sell}}_{t+} = X_t - \ln\text{LR}_-$$
 
-Applying Bayes exactly, and defining the likelihood ratio $\Lambda = \frac{1+\alpha}{1-\alpha} > 1$:
+where $X_t = \text{logit}(p_t)$. Converting back to probabilities:
 
-$$\boxed{\Pr(V=1 \mid \text{buy}) = \frac{\Lambda\mu}{\Lambda\mu + (1-\mu)}}$$
+$$\boxed{p_+ = \sigma(X_t + \ln\text{LR}_+), \qquad p_- = \sigma(X_t - \ln\text{LR}_-)}$$
 
-Symmetrically, an informed trader sells only if $V=0$:
+### 1.5 Adverse-Selection Half-Spread
 
-$$\Pr(\text{sell}\mid V=1) = \tfrac{1-\alpha}{2}, \qquad \Pr(\text{sell}\mid V=0) = \tfrac{1+\alpha}{2}$$
+The half-spread induced by adverse selection in log-odds:
 
-$$\boxed{\Pr(V=1 \mid \text{sell}) = \frac{\mu}{\mu + \Lambda(1-\mu)}}$$
+$$\boxed{\delta^x_{\text{AS}} = \tfrac{1}{2}(\ln\text{LR}_+ + \ln\text{LR}_-) \geq 0}$$
 
-A buy is evidence for $V=1$; a sell is evidence against it.
+with equality iff the trade carries no information. In price domain:
+$\delta^p_{\text{AS}} \approx p(1-p)\cdot\delta^x_{\text{AS}}$, which automatically
+vanishes at the boundary — no separate boundary treatment needed.
 
-### 1.5 Zero-Profit Quotes
+The v1 formula $\Lambda = (1+\alpha)/(1-\alpha)$ (single symmetric LR) is
+recovered as the special case $\text{LR}_+ = \text{LR}_-^{-1} = \alpha/(1-\alpha)$.
 
-The MM is competitive and risk-neutral. Zero expected profit per trade:
+### 1.6 Zero-Profit Quotes
 
-$$r^a = \Pr(V=1\mid\text{buy}), \qquad r^b = \Pr(V=1\mid\text{sell})$$
-
-### 1.6 Equilibrium Spread
-
-Defining $D^a = \frac{1+\alpha}{2}\mu + \frac{1-\alpha}{2}(1-\mu)$ and
-$D^b = \frac{1-\alpha}{2}\mu + \frac{1+\alpha}{2}(1-\mu)$:
-
-$$(1+\alpha)D^b - (1-\alpha)D^a = (1-\mu)\left[(1+\alpha)^2-(1-\alpha)^2\right] = 4\alpha(1-\mu)$$
-
-$$\boxed{r^a - r^b = \frac{4\alpha\mu(1-\mu)}{(2D^a)(2D^b)}}$$
+$$r^a = p_+ = \sigma(X_t + \ln\text{LR}_+), \qquad r^b = p_- = \sigma(X_t - \ln\text{LR}_-)$$
 
 **Key properties:**
-- $\alpha=0$: spread $=0$. No asymmetric information, no spread needed.
-- $\mu\in\{0,1\}$: spread $=0$. Resolved market has no information value.
-- Spread maximised at $\mu=0.5$ — maximum uncertainty, maximum value of private information.
-- For $\alpha\to 0.5$, $\mu=0.5$: spread $=0.5$. The MM quotes 0.25/0.75 — noise traders exit, liquidity collapses.
-
-There exists a threshold $\alpha^*$ above which the market breaks down entirely.
-Near resolution $\alpha$ rises sharply — the microstructural justification for
-halting quotes when $\tau < 5\text{ min}$ (§6.4).
+- $\text{LR}_+ = \text{LR}_- = 1$: no information, spread $= 0$.
+- $p_t \in \{0,1\}$: spread $= 0$. Resolved market has no information value.
+- Near resolution $\text{LR}_+$ rises sharply — microstructural justification for
+  halting quotes when $\tau < 5\text{ min}$ (§6.4).
 
 ### 1.7 Failure: Descriptive, Not Prescriptive
 
@@ -360,58 +361,80 @@ near resolution the process exhibits jump-like behaviour.
 
 ---
 
-## 5. Volatility Structure of Binary Contracts — Bernoulli Surface
+## 5. Logit Jump-Diffusion Kernel and Belief-Volatility Surface
 
-### 5.1 The Core Insight
+> **v2.1 replaces v1 §5 "Bernoulli surface".**
+> Defects corrected: A ($\sigma$ vs $\sigma_B$ conflation), B (variance double-count),
+> T (measure ambiguity).
 
-A binary contract pays $\mathbf{1}_{V=1}$ at $T$. The variance of the
-terminal payoff conditional on current information:
+### 5.1 Why the Bernoulli Surface Was Wrong
 
-$$\text{Var}(V\mid\mathcal{F}_t) = p_t(1-p_t)$$
+$\sigma_B(p,\tau) = \sqrt{p(1-p)/\tau}$ is the **unconditional terminal standard
+deviation** flattened over $\tau$. It is a parameter of the terminal distribution,
+not of the increment distribution. Inserting it into an HJB whose generator is a
+Laplacian in $p$ is a category error (defect A). Moreover, having both a
+$\sigma_B$ diffusion term and a jump term on $p$ double-counts variance (defect B).
 
-Distributing over remaining time $\tau=T-t$:
+### 5.2 The Correct Kernel: Logit Jump-Diffusion
 
-$$\boxed{\sigma_B(p_t,\tau)=\sqrt{\frac{p_t(1-p_t)}{\tau}}}$$
+Under $\mathbb{Q}$ we model $X_t = \text{logit}(p_t)$:
 
-Unlike Black-Scholes where $\sigma$ is exogenous, $\sigma_B$ is **endogenous**
-— fully determined by the current probability and time to resolution.
+$$dX_t = \mu_X(t,X_t)\,dt + \sigma_b(t,X_t)\,dW_t + \int_{\mathbb{R}} z\,\tilde{N}(dt,dz) \tag{K}$$
 
-### 5.2 Properties
+where $W$ is a $\mathbb{Q}$-Brownian motion and $\tilde{N}$ is the compensated
+jump measure with $\mathbb{Q}$-compensator $\nu_t(dz)\,dt$.
 
-- Symmetric around $p=0.5$; zero at $p\in\{0,1\}$
-- $\sigma_B\to\infty$ as $\tau\to 0$ — small information causes large probability moves
-- Maximum uncertainty ($p=0.5$) gives maximum volatility at any given $\tau$
+Because $p_t = \sigma(X_t)$ must be a $\mathbb{Q}$-martingale, Itô on $\sigma$
+pins down the drift:
 
-### 5.3 Substitution into Reservation Price and Spread
+$$\mu_X(t,x) = -\frac{1}{\sigma'(x)}\!\left[\tfrac{1}{2}\sigma''(x)\,\sigma_b^2
++ \int_{\mathbb{R}}\!\bigl(\sigma(x{+}z)-\sigma(x)-\sigma'(x)\chi(z)\bigr)\nu_t(dz)\right]
+\tag{K-drift}$$
 
-Replacing $\sigma$ with $\sigma_B(p_t,\tau)$ — the $\tau$ cancels in the
-inventory term:
+with $\chi(z)=z\cdot\mathbf{1}_{|z|<1}$. This constraint is what v1's
+$\sigma\to\sigma_B$ substitution silently broke.
 
-$$\tilde{p}_t = p_t - q_t\gamma\cdot\frac{p_t(1-p_t)}{\tau}\cdot\tau
-+ \frac{\rho\sigma_B\eta}{\phi}(1-e^{-\phi\tau})\cdot\hat\mu_t$$
+**Key consequence:** $\text{Var}_{\mathbb{Q}}(p_T\mid\mathcal{F}_t) \to p_t(1-p_t)$
+as $T \to$ resolution automatically, for any $\sigma_b$, $\nu_t$ trajectory,
+because $p_T \in \{0,1\}$. The Bernoulli bound is a model output, not an input.
 
-$$\boxed{\tilde{p}_t = p_t - q_t\gamma p_t(1-p_t)
-+ \frac{\rho\sigma_B\eta}{\phi}(1-e^{-\phi\tau})\cdot\hat\mu_t}$$
+### 5.3 Belief-Volatility Surface
 
-The inventory skew is **purely a function of current probability**, not time.
-Risk of holding inventory depends on how uncertain the outcome is, not on
-how much time remains.
+$\sigma_b(t,X)$ is estimated from realised quadratic variation of $X$ over
+short windows (EWMA, tick-rule denoised):
 
-**Optimal half-spread:**
+$$\hat{\sigma}_b^2(t) = \text{EWMA}_\lambda\!\left[\frac{(\Delta X_i)^2}{\Delta t_i}\right]$$
 
-$$\boxed{\frac{\delta^*}{2}=\frac{\gamma p_t(1-p_t)}{2}+\frac{1}{\gamma}\ln\!\left(1+\frac{\gamma}{\kappa}\right)}$$
+with $\lambda=0.94$ (RiskMetrics: 94% weight on history). Two empirical regularities:
+
+1. $\sigma_b$ is **U-shaped in $p$** (peaked near $p\in\{0.4,0.6\}$, flat near
+   boundaries), the opposite of $\sqrt{p(1-p)}$.
+2. $\sigma_b$ rises ~25–60% in the 30 min before a scheduled resolution event.
+
+The implementation is `belief_vol_from_ticks()` in `features/microstructure.py`,
+which returns $\sigma_b$ in units of $1/\sqrt{\text{year}}$ for direct use in
+`sigma_bar_sq = σ_b^2 · τ_\text{years}`.
+
+### 5.4 Reservation Price and Spread in Logit Space
+
+$$\boxed{\tilde{X}(t,q) = X_t - q\cdot\gamma_I\cdot\bar{\sigma}_b^2(t)\cdot\tau} \tag{2.1}$$
+
+$$\boxed{\frac{\delta^*_X}{2} = \frac{\gamma_I\bar{\sigma}_b^2(t)\,\tau}{2}
++ \frac{1}{\kappa_x}\ln\!\left(1+\frac{\gamma_I}{\kappa_x}\right)} \tag{2.2}$$
+
+$$\text{bid}_p = \sigma(\tilde{X} - \delta^*_X/2), \qquad
+\text{ask}_p = \sigma(\tilde{X} + \delta^*_X/2)$$
+
+Tick floor (automatic boundary protection):
+
+$$\delta^{\text{quote}}_p = \max\!\bigl(p(1-p)\cdot\delta^*_X,\; \$0.01\bigr) \tag{2.3}$$
 
 ```python
-def bernoulli_vol(p: float, tau: float) -> float:
-    return np.sqrt(p * (1 - p) / tau) if tau > 1e-6 else np.inf
-
-def reservation_price(p, q, gamma, mu_hat, rho, sigma_B, eta, phi, tau):
-    inventory_skew = q * gamma * p * (1 - p)
-    signal_skew    = (rho * sigma_B * eta / phi) * (1 - np.exp(-phi * tau)) * mu_hat
-    return p - inventory_skew + signal_skew
-
-def optimal_half_spread(p, gamma, kappa):
-    return gamma * p * (1 - p) / 2 + np.log(1 + gamma / kappa) / gamma
+# glft.py — espacio logit (implementation)
+reservation_X = X_t - inventory * gamma_I * sigma_bar_sq
+half_spread_X  = gamma_I * sigma_bar_sq / 2 + (1/kappa_x) * log(1 + gamma_I/kappa_x)
+bid_p = sigma(reservation_X - half_spread_X)
+ask_p = sigma(reservation_X + half_spread_X)
 ```
 
 ---
@@ -425,119 +448,174 @@ As $\tau\to 0$, two observations break all diffusion models:
 1. **Liquidity dries up**: the last active participants are disproportionately informed
 2. **Jump resolution**: the price jumps to 0 or 1 when the outcome becomes known
 
-$\sigma_B\to\infty$ as $\tau\to 0$, causing optimal spreads to diverge.
+### 6.2 Jump-Diffusion Process on $X_t$ (v2.1)
 
-### 6.2 Proposed Jump-Diffusion Process
+> **v2.1 corrections (defects B, C, L):**
+> - Process now on $X_t = \text{logit}(p_t)$, not $p_t$ — keeps $p \in (0,1)$ automatically.
+> - Jump intensity corrected to model information acceleration (defect L).
+> - MM loss formula corrected to second moment (defect C).
 
-For $\tau<\tau^*$:
+The jump-diffusion kernel (K) from §5 already contains the jump term. For the
+near-resolution information-acceleration regime, we parameterise the jump intensity as:
 
-$$dp_t = \hat\mu_t\,dt + \sigma_B(p_t,\tau)\,dW_t + (J_t-p_t)\,dN_t$$
+$$\boxed{\lambda_J(\tau) = \lambda_0\cdot\left(\frac{\tau^*}{\tau+\varepsilon}\right)^\eta},
+\qquad \eta\in(0,1),\; \varepsilon\sim\text{tick spacing in seconds}$$
 
-where:
-- $dN_t\sim\text{Poisson}(\lambda_J(\tau)\,dt)$: jump intensity increasing as $\tau\to 0$
-- $J_t\in\{0,1\}$: $\Pr(J_t=1)=p_t$
-- $(J_t-p_t)$: jump size — at $p=0.7$: YES jump is $+0.3$, NO jump is $-0.7$
+This is bounded and integrable (unlike the v1 $e^{\beta\tau}$ which is bounded by
+$\lambda_0$ at $\tau=0$ and cannot model acceleration), and converges to
+$\lambda_0(\tau^*/\varepsilon)^\eta$ as $\tau\to 0$.
 
-Jump intensity:
+Under the martingale constraint, jumps have **zero first moment** ($\mathbb{E}[p_+ - p \mid \text{jump}] = 0$).
+Therefore the correct CARA penalty from a jump is **second-moment and quadratic in $q$**:
 
-$$\lambda_J(\tau) = \lambda_0\cdot e^{\beta\tau}$$
+$$\boxed{\Delta\text{Loss}(q,\tau) = \tfrac{1}{2}\gamma_I q^2\cdot\sigma_J^2\cdot\lambda_J(\tau)\cdot\Delta t}$$
 
-Rare far from resolution, increasingly frequent as $\tau\to 0$.
+where $\sigma_J^2 = \mathbb{E}[(p_+ - p)^2]$ over the jump distribution. The v1
+expression $|q|\cdot p(1-p)\cdot\lambda_J\cdot\Delta t$ was a first-moment term —
+incorrect once the martingale constraint is imposed.
 
-### 6.3 Expected MM Loss from a Resolution Jump
+### 6.3 Resolution Risk as a Separate Option
 
-$$\mathbb{E}[\text{Loss}\mid q,p,\tau] = |q|\cdot p(1-p)\cdot\lambda_J(\tau)\cdot\Delta t$$
+Holding a winning Polymarket token involves a short option on the UMA dispute outcome:
+
+$$\text{Settlement value} = 1 - L\cdot\mathbf{1}\{\text{UMA reverses}\}$$
+
+with $L=\$1$ (full token loss). Approximating $\Pr(\text{reverse})\approx r$:
+- Non-contested (sports, Chainlink feeds): $r\approx 0.001$
+- Contested (ambiguous resolution criteria): $r\approx 0.005{-}0.02$
+
+The option-adjusted inventory cap (guarantees strict positivity for all $r,\psi$):
+
+$$\boxed{q_{\max}(t) = q^0_{\max}\cdot\exp(-r\cdot\psi(\tau)),
+\qquad \psi(\tau) = \exp(-\tau/\tau^*)} \tag{8.2}$$
 
 ### 6.4 Practical Near-Resolution Rules
 
-Implemented in `execution/risk/limits.py`:
+Implemented in `features/resolution.py` and used by `strategies/market_making/glft.py`:
 
 ```
-τ < 24h:  Q_max = Q/2,   γ_effective = 2γ
-τ < 1h:   Q_max = 1,     halt quoting on inventory-heavy side
-τ < 5min: halt all quoting
+τ ≥ 24h:  NORMAL   — q_max = Q·exp(-r·ψ(τ)),  γ_eff = γ
+τ < 24h:  WARNING  — q_max ≤ Q/2,             γ_eff = 2γ
+τ < 1h:   CRITICAL — q_max ≤ Q/10,            γ_eff = 4γ, halt one side
+τ < 5min: HALT     — halt all quoting
 ```
 
 ---
 
 ## 7. Cross-Venue Arbitrage Sizing — Kelly Criterion
 
-### 7.1 The Arbitrage Setup
+> **v2.1 corrections (defects H, O, P):**
+> - Separate $\gamma_I$ (CARA) from $\varphi_K$ (Kelly fraction).
+> - Oracle reversal probability $r$ added; effective probability $p_\text{eff}$.
+> - USDC–USD basis $b_U$ included.
+> - Denominator $c(1-c)$ explained as down×up, not Bernoulli variance.
 
-When $p^K < p^P$ for the same event on Kalshi and Polymarket:
+### 7.1 Single-Venue Binary Kelly with Frictions
 
-- Buy YES on Kalshi at $p^K$
-- Buy NO on Polymarket at $1-p^P$
+For a binary contract bought at price $c$ with model probability $p$ and
+oracle reversal probability $r$ (independent of $Y$):
 
-Locked profit per unit: $\Pi = p^P - p^K > 0$
+$$p_\text{eff} = p(1-r) + (1-p)r = p + r(1-2p)$$
 
-Risks: execution risk, resolution divergence, platform risk, liquidity risk.
+After proportional taker fee $f_t$, capital cost $\rho_c\tau$, and USDC basis $b_U$:
 
-### 7.2 Kelly Criterion
+$$\boxed{f^* = \varphi_K\cdot\frac{[p + r(1-2p)] - c - f_t - \rho_c\tau - b_U}{c(1-c)}} \tag{8.1}$$
 
-For win probability $p_{\text{exec}}$ and odds $b=\frac{\Pi}{1-\Pi+C}$:
+with $\varphi_K \in [0.25, 0.5]$. The denominator $c(1-c)$ is the product
+(downside per dollar staked) $\times$ (upside per dollar staked) from
+$\arg\max_f\{p\ln(1+f\cdot(1-c)/c)+(1-p)\ln(1-f)\}$ — not the Bernoulli variance
+(they coincide only when $c=p$, i.e., zero edge).
 
-$$\boxed{f^* = p_{\text{exec}} - \frac{(1-p_{\text{exec}})(1-\Pi+C)}{\Pi}}$$
+Note: when $p > 0.5$, the oracle term $r(1-2p) < 0$ automatically reduces the edge.
 
-Use **half-Kelly** in practice: $f_{\text{actual}} = \frac{1}{2}f^*$
+### 7.2 Cross-Venue (Kalshi YES + Polymarket NO) Arb Sizing
+
+Buy YES on Kalshi at $c_K$ and NO on Polymarket at $c_P$. Expected joint P&L:
+
+$$\mathbb{E}[\text{P\&L}] = (1 - c_K - c_P) + r_P(2p-1)$$
+
+Static arb exists when $\mathbb{E}[\text{P\&L}] > \Pi_X$ where:
+
+$$\Pi_X = f_{t,K} + f_{t,P} + b_U\cdot\tau + \rho_c\cdot\tau + \text{gas} + \text{slippage}$$
+
+The Polymarket dispute risk $r_P$ enters as outcome-asymmetric P&L, not as a
+deterministic premium in $\Pi_X$. When $p\approx 0.5$ the asymmetry vanishes.
 
 ### 7.3 Minimum Viable Edge
 
-$f^* > 0$ requires:
+$$|\varepsilon_t| > \Pi_{\min} := f_t + \text{slippage} + r\cdot c + \rho_c\tau + b_U$$
 
-$$\boxed{p_{\text{exec}} > \frac{1-\Pi+C}{1+C}}$$
-
-With $C\approx 0.002$ and $p_{\text{exec}}\geq 0.90$: $\Pi_{\min}\approx 1.1\%$
+On a 50-cent contract: $\Pi_{\min}\approx 1.8\%$ (Kalshi) and $\approx 0.5\%$
+(Polymarket, politics fee-free) excluding capital cost.
 
 ```python
-def kelly_fraction(spread, p_exec, cost=0.002, fraction=0.5):
-    b = spread / (1 - spread + cost)
-    f_full = p_exec - (1 - p_exec) / b
-    return max(0.0, fraction * f_full)
+# Fractional Kelly — §8.1 MATH.md v2.1
+def kelly_fraction(c, p, r_oracle, f_t, rho_c, tau, b_U=0.0, phi_K=0.25):
+    p_eff  = p + r_oracle * (1 - 2 * p)
+    numer  = p_eff - c - f_t - rho_c * tau - b_U
+    denom  = c * (1 - c)                    # down × up, not Bernoulli variance
+    return max(0.0, phi_K * numer / denom)
 ```
 
 ---
 
-## 8. Calibration Framework — Bayesian Updating & Brier Score
+## 8. Calibration Framework — Brier Score & Recalibration
 
-### 8.1 Brier Score Decomposition
+### 8.1 Brier Score Decomposition (v2.1 — with within-bin terms)
 
-$$\text{BS}=\frac{1}{N}\sum_i(p_i-o_i)^2
-=\underbrace{\text{REL}}_{\text{calibration}}
--\underbrace{\text{RES}}_{\text{resolution}}
-+\underbrace{\text{UNC}}_{\text{uncertainty}}$$
+> **v2.1 correction (defect Q):** The v1 identity $\text{Br}=\text{REL}-\text{RES}+\text{UNC}$
+> holds only in expectation. With finite binning into $K$ bins it acquires two
+> within-bin terms (Stephenson–Casati–Wilks 2008).
 
-REL $=0$ is perfect calibration. Higher RES means more informative predictions.
+$$\boxed{\text{Br} = \text{REL} - \text{RES} + \text{UNC} + \text{WBV} - 2\,\text{WBC}}$$
 
-### 8.2 Isotonic Recalibration
+where:
+- $\text{WBV}_k = \text{Var}_k(f)$ — within-bin forecast variance
+- $\text{WBC}_k = \text{Cov}_k(f, o)$ — within-bin forecast–outcome covariance
+- The factor 2 comes from the cross-term $-2(f_i-\bar{f}_k)(o_i-\bar{o}_k)$ in $(f_i-o_i)^2$
 
-If REL $> 0$, apply isotonic regression (Pool Adjacent Violators, $O(N)$):
+Defining **generalised resolution** $\text{GRES} := \text{RES} + 2\,\text{WBC} - \text{WBV}$,
+the compact form $\text{Br} = \text{REL} - \text{GRES} + \text{UNC}$ is bin-width invariant.
 
-$$\hat p_i=\arg\min_{f\,\text{non-decreasing}}\sum_i(f(p_i)-o_i)^2$$
+We use $K=20$ quantile bins and report all five components with bootstrap CIs.
 
-### 8.3 Bayesian Signal Update
+### 8.2 Recalibration
 
-Given prior $p_0$ and likelihood ratio $\Lambda=\alpha/(1-\alpha)$:
+> **v2.1 correction (defect R):** Isotonic regression is biased on autocorrelated
+> series. Use sequential / out-of-time refit and Venn–Abers predictors instead.
 
-$$p_{\text{post}}=\frac{\Lambda p_0}{\Lambda p_0+(1-p_0)}$$
+Recommended calibration pipeline:
+1. **Out-of-time split**: fit on weeks $[w-4, w-1]$, score on week $w$, roll forward.
+2. **Venn–Abers predictors** (Vovk–Petej 2014): valid coverage even under
+   exchangeability violations. Default for our pipeline.
+3. **Beta calibration** fallback when $|\text{labelled markets}| < 2000$.
 
-Multiple independent signals combine in log-odds space:
+### 8.3 Bayesian Signal Update in Log-Odds
 
-$$\text{logit}(p_{\text{final}})=\text{logit}(p_0)+\sum_k\ln\Lambda_k$$
+With conditionally-independent signals $s_k$ given outcome $Y$:
+
+$$X^{\text{posterior}} = X^{\text{prior}} + \sum_k \ln\Lambda_k(s_k), \qquad
+\Lambda_k(s) = \frac{\Pr(s_k=s\mid Y=1)}{\Pr(s_k=s\mid Y=0)}$$
+
+**Valid only after orthogonalisation.** OBI is mechanically caused by the same news
+that drives NewsSignal on the same horizon, so $\text{OBI}\perp\text{News}\mid Y$
+is empirically violated (defect J). We Cholesky-factor the empirical covariance of
+$(s_1,\ldots,s_K)$ and update only on the residuals.
 
 ---
 
-## 9. Summary: Model Evolution
+## 9. Summary: Model Evolution (v2.1)
 
-| Model | Key contribution | Remaining gap |
-|-------|-----------------|---------------|
-| Glosten-Milgrom | Spread from adverse selection, exact Bayesian quotes | Not prescriptive |
-| Avellaneda-Stoikov | Dynamic inventory-optimal quotes, CARA + HJB | Approx HJB, no signal, Gaussian $p$ |
-| GLFT | Exact HJB, explicit order flow, asymmetric spreads | No directional signal |
-| Cartea-Jaimungal | Signal $\hat\mu_t$ shifts reservation price | Gaussian $p$, constant $\sigma$ |
-| + Bernoulli surface | Correct $\sigma_B(p,\tau)$, $\tau$ cancels in inventory skew | Near-resolution breaks |
-| + Jump-diffusion | Resolution risk, expected loss, halt rules | No closed form |
-| + Kelly sizing | Principled arb sizing, minimum viable edge $\Pi_{\min}$ | — |
+| Model | Key contribution | Remaining open |
+|-------|-----------------|----------------|
+| Glosten-Milgrom | Adverse selection; asymmetric LR+/LR– in log-odds | Trader heterogeneity (MoE) |
+| Avellaneda-Stoikov | Inventory-optimal quotes, CARA + HJB in logit | Taylor approx for large $q$ |
+| GLFT exact | Exact HJB (ODE system), asymmetric spreads | Numerically costly for large $Q$ |
+| Cartea-Jaimungal | OU $\mu_t$ under $\mathbb{P}$; $\rho_\mu$ discount for measure risk | Multi-signal orthogonalisation |
+| Logit kernel (§5) | Single $\mathbb{Q}$-martingale; $\sigma_b(t,X)$ from realised QV | Hawkes-driven $\sigma_b$ |
+| Jump-diffusion (§6) | $\lambda_J\propto\tau^{-\eta}$; second-moment loss; oracle option | MOOV2 proposer concentration |
+| Kelly v2.1 (§7) | $p_\text{eff}=p+r(1-2p)$; USDC basis; $c(1-c)$ denominator | Latency arbitrage (73% bots) |
+| Calibration (§8) | Brier + WBV−2WBC; Venn–Abers; out-of-time refit | Regime change / concept drift |
 
 ---
 

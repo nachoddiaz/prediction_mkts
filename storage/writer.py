@@ -179,7 +179,7 @@ class MarketDataWriter:
           pero mantiene el uso de memoria acotado.
         """
         if self._queue.qsize() >= self._flush_max_items:
-            await self._flush_now()
+            await self.flush_now()
 
         await self._queue.put(item)
 
@@ -234,12 +234,12 @@ class MarketDataWriter:
                     # Timer expirado — hacer flush de lo que haya (puede ser 0)
                     pass
 
-                await self._flush_now()
+                await self.flush_now()
 
             except Exception as e:
                 log.error("Error in flush loop: %s", e, exc_info=True)
 
-    async def _flush_now(self) -> None:
+    async def flush_now(self) -> None:
         """
         Vacía la queue y escribe todos los items en DuckDB en batch.
 
@@ -478,7 +478,7 @@ class MarketDataWriter:
                 r["obi"],
                 r["quoted_spread"],
                 r["relative_spread"],
-                r["bernoulli_vol"],
+                r["belief_vol"],
                 r["ewma_vol"],
                 r["tau_years"],
                 r["mu_hat"],
@@ -489,7 +489,7 @@ class MarketDataWriter:
             """
             INSERT INTO features
                 (market_id, venue, timestamp, obi, quoted_spread,
-                 relative_spread, bernoulli_vol, ewma_vol, tau_years, mu_hat)
+                 relative_spread, belief_vol, ewma_vol, tau_years, mu_hat)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             tuples,

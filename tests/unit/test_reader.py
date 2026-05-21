@@ -178,7 +178,7 @@ class TestOperacional:
                 "obi": 0.3,
                 "quoted_spread": 0.02,
                 "relative_spread": 4.4,
-                "bernoulli_vol": 0.015,
+                "belief_vol": 0.015,
                 "ewma_vol": 0.009,
                 "tau_years": 0.001,
                 "mu_hat": 0.01,

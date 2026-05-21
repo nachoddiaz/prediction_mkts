@@ -233,7 +233,7 @@ class TestLatest:
         db.store.compute_and_store("kalshi:KXBTC-TEST", tau)
         features = db.store.latest("kalshi:KXBTC-TEST")
         assert features is not None
-        required = {"obi", "bernoulli_vol", "ewma_vol", "tau_years", "mu_hat"}
+        required = {"obi", "belief_vol", "ewma_vol", "tau_years", "mu_hat"}
         assert required.issubset(features.keys())
         db.close()
 

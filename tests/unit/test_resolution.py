@@ -13,7 +13,6 @@ Por qué controlamos 'now' en todos los tests:
 
 from __future__ import annotations
 
-import math
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -23,7 +22,6 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 from features.resolution import (
     NearResolutionRegime,
-    bernoulli_vol_safe,
     compute_resolution_features,
     effective_gamma,
     effective_q_max,
@@ -248,28 +246,6 @@ class TestHelpers:
         rf = compute_resolution_features(resolution_in(minutes=1), now=NOW)
         assert effective_q_max(100.0, rf) == pytest.approx(0.0)
 
-    def test_bernoulli_vol_safe_normal(self) -> None:
-        """En régimen NORMAL devuelve σ_B correcto."""
-        rf = compute_resolution_features(resolution_in(days=30), now=NOW)
-        vol = bernoulli_vol_safe(0.5, rf)
-        expected = math.sqrt(0.25 / rf.tau_years)
-        assert vol == pytest.approx(expected, rel=1e-4)
-
-    def test_bernoulli_vol_safe_halt(self) -> None:
-        """En HALT devuelve 100.0 en lugar de inf."""
-        rf = compute_resolution_features(resolution_in(minutes=1), now=NOW)
-        vol = bernoulli_vol_safe(0.5, rf)
-        assert vol == pytest.approx(100.0)
-
-    def test_bernoulli_vol_safe_resolved(self) -> None:
-        """En RESOLVED devuelve 100.0."""
-        past = NOW - timedelta(days=1)
-        rf = compute_resolution_features(past, now=NOW)
-        vol = bernoulli_vol_safe(0.5, rf)
-        assert vol == pytest.approx(100.0)
-
-    def test_bernoulli_vol_safe_p_extremo(self) -> None:
-        """Con p=0 o p=1 devuelve 100.0 (sin incertidumbre → no cotizar)."""
-        rf = compute_resolution_features(resolution_in(days=30), now=NOW)
-        assert bernoulli_vol_safe(0.0, rf) == pytest.approx(100.0)
-        assert bernoulli_vol_safe(1.0, rf) == pytest.approx(100.0)
+    # ELIMINADO: tests de bernoulli_vol_safe — función obsoleta según MATH.md v2.1
+    # La volatilidad ahora se calcula desde variación cuadrática de logit(p)
+    # usando belief_vol_from_ticks(), no analíticamente desde p y τ.

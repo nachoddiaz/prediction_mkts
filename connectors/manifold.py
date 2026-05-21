@@ -41,6 +41,7 @@ from normalizer.schema import (
     OrderBookLevel,
     Price,
     Resolution,
+    Side,
     Size,
     Tick,
     TickType,
@@ -92,13 +93,17 @@ class ManifoldConnector(BaseConnector):
         Manifold devuelve muchos tipos de mercados (múltiple choice,
         numeric, etc.). Filtramos solo los binarios (YES/NO) que son
         equivalentes a los contratos binarios de Kalshi/Polymarket.
+
+        Ordenados por volumen de actividad (most-traded) descendente
+        para priorizar los mercados con más datos — útil para
+        acumular ticks rápidamente para calibración y backtesting.
         """
         data = await self._get(
             f"{MANIFOLD_BASE}/search-markets",
             params={
                 "term": "",
                 "limit": MARKET_LIMIT,
-                "sort": "liquidity",
+                "sort": "most-popular",
                 "filter": "open",
                 "contractType": "BINARY",
             },
@@ -106,6 +111,10 @@ class ManifoldConnector(BaseConnector):
 
         if not data or not isinstance(data, list):
             return []
+
+        # Ordenar por número total de trades (totalBets) descendente
+        # para que los mercados más poblados (más actividad) estén primero.
+        data.sort(key=lambda m: m.get("volume", 0), reverse=True)
 
         markets = []
         for raw in data:
@@ -116,7 +125,7 @@ class ManifoldConnector(BaseConnector):
             except Exception as e:
                 log.warning("Manifold: failed to parse market: %s", e)
 
-        log.info("Manifold: fetched %d binary markets", len(markets))
+        log.info("Manifold: fetched %d binary markets (sorted by volume desc)", len(markets))
         return markets
 
     async def get_snapshot(self, market_id: str) -> MarketSnapshot | None:
@@ -158,6 +167,69 @@ class ManifoldConnector(BaseConnector):
         except Exception as e:
             log.warning("Manifold: failed to build snapshot for %s: %s", market_id, e)
             return None
+
+    async def backfill_market(self, market_id: str) -> None:
+        """
+        Descarga las apuestas históricas (bets) de un mercado y las emite como ticks.
+        Esto permite poblar la base de datos DuckDB con historial real
+        inmediatamente al arrancar la aplicación.
+        """
+        raw_id = market_id.split(":", 1)[-1]
+        log.info("Manifold: backfilling bets for %s...", market_id)
+
+        # Obtener las últimas 1000 apuestas
+        data = await self._get(
+            f"{MANIFOLD_BASE}/bets",
+            params={
+                "contractId": raw_id,
+                "limit": 1000,
+            },
+        )
+
+        if not data or not isinstance(data, list):
+            log.info("Manifold: no historical bets found for %s", market_id)
+            return
+
+        # Las apuestas vienen de más recientes a más antiguas.
+        # Las invertimos para procesarlas cronológicamente.
+        data.reverse()
+
+        ticks_emitted = 0
+        spread = 0.02
+        for b in data:
+            try:
+                prob = b.get("probAfter")
+                if prob is None or prob <= 0 or prob >= 1:
+                    continue
+
+                created_time = b.get("createdTime")
+                if not created_time:
+                    continue
+
+                timestamp = datetime.fromtimestamp(created_time / 1000, tz=UTC)
+
+                bid = max(0.001, round(prob - spread / 2, 4))
+                ask = min(0.999, round(prob + spread / 2, 4))
+                if bid >= ask:
+                    bid = round(prob - 0.001, 4)
+                    ask = round(prob + 0.001, 4)
+
+                tick = Tick(
+                    market_id=MarketId(Venue.MANIFOLD, raw_id),
+                    timestamp=timestamp,
+                    tick_type=TickType.TRADE,
+                    yes_bid=Price(bid),
+                    yes_ask=Price(ask),
+                    volume=Size(abs(b.get("amount", 0.0))),
+                    side=Side.YES if b.get("outcome") == "YES" else Side.NO,
+                )
+
+                await self._on_tick(tick)
+                ticks_emitted += 1
+            except Exception as e:
+                log.warning("Manifold: error parsing bet for %s: %s", market_id, e)
+
+        log.info("Manifold: backfilled %d ticks for %s", ticks_emitted, market_id)
 
     async def subscribe(self, market_ids: list[str]) -> None:
         """

@@ -194,12 +194,18 @@ class BaseConnector(ABC):
                 len(markets),
             )
 
-            # Paso 2: snapshot inicial de cada mercado
+            # Paso 2: snapshot inicial de cada mercado y backfill si aplica
             for market_id in market_ids:
                 snapshot = await self.get_snapshot(market_id)
                 if snapshot is not None:
                     await self._on_snapshot(snapshot)
                     log.debug("Initial snapshot: %s", market_id)
+                    # Backfill si la venue lo soporta
+                    if hasattr(self, "backfill_market"):
+                        try:
+                            await self.backfill_market(market_id)
+                        except Exception as e:
+                            log.warning("Failed to backfill market %s: %s", market_id, e)
 
             # Paso 3: suscribirse con reconexión automática
             retry = 0

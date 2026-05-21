@@ -320,10 +320,10 @@ async def test_polymarket_orderbook_live() -> None:
         best_bid = float(sell_data["price"])
         mid = float(mid_data["mid"])
 
-        # Corregir si están invertidos
+        # Corregir si están invertidos o salen de los límites [0, 1]
         if best_bid >= best_ask:
-            best_bid = mid - 0.001
-            best_ask = mid + 0.001
+            best_bid = max(0.0001, mid - 0.001)
+            best_ask = min(0.9999, mid + 0.001)
             print("\n  ⚠ bid >= ask — ajustando spread mínimo")
 
         from normalizer.schema import MarketId, OrderBook, OrderBookLevel, Price, Size

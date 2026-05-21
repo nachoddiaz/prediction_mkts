@@ -143,9 +143,9 @@ CREATE TABLE IF NOT EXISTS features (
     quoted_spread   DOUBLE,
     relative_spread DOUBLE,
 
-    -- Volatilidad de Bernoulli σ_B(p, τ) = sqrt(p(1-p)/τ)
-    -- Endógena — no necesita calibración
-    bernoulli_vol   DOUBLE,
+    -- Volatilidad en espacio logit σ_b desde variación cuadrática de X = logit(p)
+    -- Calibrada empíricamente — §3 del MATH.md v2.1
+    belief_vol      DOUBLE,
 
     -- Volatilidad EWMA empírica — complementa σ_B
     -- Si ewma_vol >> bernoulli_vol → régimen de jump

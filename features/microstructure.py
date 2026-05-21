@@ -19,8 +19,8 @@ Tres secciones:
 Relación con el MATH.md:
   OBI            → w_1 en μ̂_t = w_1·OBI + w_2·News + w_3·OnChain (§4.6)
   quoted_spread  → comparación con δ* óptimo de GLFT (§3)
-  bernoulli_vol  → σ_B(p,τ) = √(p(1-p)/τ) — entra en δ*/2 y p̃ (§5.3)
-  ewma_vol       → validación empírica de σ_B; alarma de régimen jump (§6.1)
+  belief_vol     → σ_b(X) desde variación cuadrática de X = logit(p) (§3 v2.1)
+  ewma_vol       → validación empírica de σ_b; alarma de régimen jump (§6.1)
   mu_hat         → proxy de μ̂_t hasta calibrar señal completa (§4.6)
 """
 
@@ -28,13 +28,16 @@ from __future__ import annotations
 
 import math
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
 
-from normalizer.schema import OrderBook, Tick
+from normalizer.schema import OrderBook
 from storage.reader import MarketDataReader
+
+if TYPE_CHECKING:
+    from features.signals.ensemble import SignalEnsemble
 
 # ---------------------------------------------------------------------------
 # Constante EWMA
@@ -133,47 +136,62 @@ def relative_spread(ob: OrderBook) -> float | None:
     return float(spr / mid)
 
 
-def bernoulli_vol(p: float, tau_years: float) -> float:
+# volatilidad en espacio logit
+def belief_vol_from_ticks(ticks_df: pd.DataFrame, ewma_lambda: float = EWMA_LAMBDA) -> float:
     """
-    Volatilidad endógena de un contrato binario — superficie de Bernoulli.
+    Estima σ_b desde variación cuadrática realizada de X = logit(p).
+    §3 del MATH.md v2.1 — reemplaza bernoulli_vol.
 
-    σ_B(p, τ) = √(p(1-p) / τ)
+    σ_b tiene unidades 1/√año para ser consistente con
+      sigma_bar_sq = σ_b² · τ_years  (adimensional)
+    en glft.py. Cada incremento dX se normaliza por Δt_años antes
+    de entrar en el EWMA — sin esta normalización σ_b tendría unidades
+    de 1/√paso y sigma_bar_sq quedaría mal escalado.
 
-    Esta es la volatilidad teórica que entra en GLFT (§5.3):
-      - Reservation price: p̃ = p - q·γ·p(1-p)  [τ se cancela]
-      - Optimal half-spread: δ*/2 = γ·p(1-p)/2 + (1/γ)·ln(1 + γ/κ)
-
-    Por qué es endógena:
-      No necesita calibración. p está en el precio del mercado
-      y τ está en la fecha de resolución. Ambos son observables.
-
-    A diferencia de Black-Scholes donde σ es exógeno y hay que
-    calibrarlo desde opciones, aquí σ_B se deriva directamente
-    de la estructura del contrato binario.
-
-    Args:
-        p:         probabilidad implícita ∈ (0, 1)
-        tau_years: tiempo hasta resolución en años > 0
-
-    Returns:
-        float ≥ 0. inf si τ ≤ 0 (near-resolution).
-        Usar bernoulli_vol_safe() de resolution.py para evitar inf.
+    EWMA RiskMetrics: σ²_t = λ·σ²_{t-1} + (1-λ)·(dX/dt)²
+    Con λ=0.94: 94% de peso al estimado histórico, 6% al nuevo punto.
     """
-    if tau_years <= 1e-9:
-        return math.inf
-
-    if not 0.0 < p < 1.0:
+    if len(ticks_df) < 2:
         return 0.0
 
-    return math.sqrt(p * (1.0 - p) / tau_years)
+    df = (
+        ticks_df.sort_values("timestamp").reset_index(drop=True)
+        if "timestamp" in ticks_df.columns
+        else ticks_df.reset_index(drop=True)
+    )
+
+    mids = df["mid"].values.astype(float)
+    mids = np.clip(mids, 1e-6, 1 - 1e-6)
+    X = np.log(mids / (1 - mids))  # logit(p)
+    dX = np.diff(X)
+
+    # Calcular Δt en años desde timestamps; fallback a 1 minuto si no disponible
+    _SECS_PER_YEAR = 365.25 * 24 * 3600
+    if "timestamp" in df.columns and len(df) > 1:
+        ts = pd.to_datetime(df["timestamp"]).values
+        dt_ns = np.diff(ts).astype("float64")
+        dt_years = dt_ns / 1e9 / _SECS_PER_YEAR
+    else:
+        dt_years = np.full(len(dX), 60.0 / _SECS_PER_YEAR)  # 1 minuto
+
+    # Usar solo pasos con Δt > 0
+    mask = dt_years > 0
+    if not mask.any():
+        return 0.0
+    dX = dX[mask]
+    dt_years = dt_years[mask]
+
+    # EWMA sobre dX²/Δt — fórmula RiskMetrics: var = λ·var + (1-λ)·(dX²/dt)
+    var = float(dX[0] ** 2 / dt_years[0])
+    for dx, dt in zip(dX[1:], dt_years[1:], strict=False):
+        var = ewma_lambda * var + (1.0 - ewma_lambda) * (dx**2 / dt)
+
+    return float(math.sqrt(max(var, 0.0)))
 
 
-def bernoulli_vol_from_tick(tick: Tick, tau_years: float) -> float:
-    """
-    σ_B calculada desde el mid-price de un Tick.
-    Convenience wrapper para uso en el feature store.
-    """
-    return bernoulli_vol(tick.mid, tau_years)
+# ELIMINADO: bernoulli_vol_from_tick — función obsoleta según MATH.md v2.1
+# La volatilidad ahora se calcula desde variación cuadrática de logit(p)
+# usando belief_vol_from_ticks() que opera sobre series de ticks, no ticks individuales.
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -235,7 +253,7 @@ def ewma_vol(
     var = float(dp[0] ** 2 / dt_years[0]) if dt_years[0] > 0 else 0.0
     for r, t in zip(dp[1:], dt_years[1:], strict=False):
         if t > 0:
-            var = (1 - lam) * var + lam * (r**2 / t)
+            var = lam * var + (1 - lam) * (r**2 / t)
 
     return float(math.sqrt(max(var, 0.0)))
 
@@ -272,7 +290,7 @@ def ewma_vol_series(
         if t <= 0 or math.isnan(var):
             var = r**2 / t if t > 0 else float("nan")
         else:
-            var = (1 - lam) * var + lam * (r**2 / t)
+            var = lam * var + (1 - lam) * (r**2 / t)
         vols.append(math.sqrt(max(var, 0.0)) if not math.isnan(var) else float("nan"))
 
     return pd.Series(vols, index=df.index).reindex(ticks_df.index)
@@ -334,6 +352,9 @@ def compute_features_from_db(
     tau_years: float,
     ewma_window: int = 50,
     obi_levels: int = 5,
+    ensemble: SignalEnsemble | None = None,
+    news: float = 0.0,
+    onchain: float = 0.0,
 ) -> dict[str, Any] | None:
     """
     Pipeline principal — lee de DuckDB y calcula todas las features.
@@ -345,13 +366,8 @@ def compute_features_from_db(
       1. Lee último orderbook  → OBI, quoted_spread, relative_spread
       2. Lee últimos N ticks   → EWMA vol, mid actual
       3. Calcula σ_B           → con mid y tau
-      4. μ̂ aproximado          → OBI como proxy hasta calibrar señal completa
-
-    Por qué OBI como proxy de μ̂:
-      Hasta calibrar Ridge regression + AR(1) (§4.6 del MATH.md),
-      el OBI es la mejor señal disponible en tiempo real.
-      OBI > 0 implica presión compradora → drift alcista → μ̂ > 0.
-      Los pesos w_i se calibrarán en models/signals/ensemble.py.
+      4. μ̂                     → ensemble.compute_mu_hat(obi, news, onchain)
+                                  o OBI proxy si no hay ensemble
 
     Args:
         market_id:   string canónico "venue:raw_id"
@@ -359,6 +375,9 @@ def compute_features_from_db(
         tau_years:   tiempo hasta resolución en años (de Resolution.tau)
         ewma_window: número de ticks históricos para EWMA
         obi_levels:  niveles del libro para OBI
+        ensemble:    SignalEnsemble calibrado; None = usar OBI como proxy
+        news:        señal de noticias normalizada ∈ [-1, 1]
+        onchain:     señal on-chain normalizada ∈ [-1, 1]
 
     Returns:
         Dict con todas las features, None si no hay datos suficientes.
@@ -397,22 +416,22 @@ def compute_features_from_db(
     if ticks_df.empty:
         return None
 
-    mid_current = float(ticks_df["mid"].iloc[0])
     timestamp = ticks_df["timestamp"].iloc[0]
-
-    # Preferir mid del orderbook (más preciso que el tick)
-    p = mid_from_ob if mid_from_ob is not None else mid_current
 
     # EWMA en orden ASC (latest_ticks devuelve DESC)
     ticks_asc = ticks_df.sort_values("timestamp").reset_index(drop=True)
     ewma = ewma_vol(ticks_asc)
 
-    # --- 3. Bernoulli vol ---
-    bvol = bernoulli_vol(p, tau_years)
+    # --- 3. Belief vol (volatilidad en espacio logit) ---
+    # Calculada desde variación cuadrática de X = logit(p) según §3 MATH.md v2.1
+    bvol = belief_vol_from_ticks(ticks_asc)
     bvol_stored = float(bvol) if not math.isinf(bvol) else None
 
-    # --- 4. μ̂ aproximado como OBI ---
-    mu_hat = obi_val
+    # --- 4. μ̂ via ensemble o proxy OBI ---
+    if ensemble is not None:
+        mu_hat = ensemble.compute_mu_hat(obi=obi_val, news=news, onchain=onchain)
+    else:
+        mu_hat = obi_val
 
     # --- Venue desde market_id ---
     venue = market_id.split(":")[0] if ":" in market_id else "unknown"
@@ -432,7 +451,7 @@ def compute_features_from_db(
         "obi": round(obi_val, 6),
         "quoted_spread": round(float(q_spread), 6) if q_spread is not None else None,
         "relative_spread": round(float(r_spread), 6) if r_spread is not None else None,
-        "bernoulli_vol": round(bvol_stored, 6) if bvol_stored is not None else None,
+        "belief_vol": round(bvol_stored, 6) if bvol_stored is not None else None,
         "ewma_vol": round(ewma, 6),
         "tau_years": round(tau_years, 8),
         "mu_hat": round(mu_hat, 6),

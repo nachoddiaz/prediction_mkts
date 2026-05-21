@@ -144,6 +144,7 @@ def make_callbacks(
     async def on_tick(tick: Tick) -> None:
         """Persiste el tick y recalcula features."""
         await writer.enqueue(tick)
+        await writer.flush_now()
 
         market_id = str(tick.market_id)
         market = markets_cache.get(market_id)
@@ -174,6 +175,7 @@ def make_callbacks(
     async def on_snapshot(snapshot: MarketSnapshot) -> None:
         """Persiste el snapshot completo y recalcula features."""
         await writer.enqueue_snapshot(snapshot)
+        await writer.flush_now()
 
         market_id = str(snapshot.market.market_id)
         markets_cache[market_id] = snapshot.market

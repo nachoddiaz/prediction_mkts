@@ -25,11 +25,17 @@ Relación con el MATH.md:
 from __future__ import annotations
 
 import logging
+from typing import TYPE_CHECKING
 
 from features.microstructure import compute_features_from_db
 from normalizer.schema import Market, MarketSnapshot, Tick
 from storage.reader import MarketDataReader
 from storage.writer import MarketDataWriter
+
+if TYPE_CHECKING:
+    from features.signals.ensemble import SignalEnsemble
+    from features.signals.news import NewsSignal
+    from features.signals.onchain import OnChainSignal
 
 log = logging.getLogger(__name__)
 
@@ -56,9 +62,15 @@ class FeatureStore:
         self,
         reader: MarketDataReader,
         writer: MarketDataWriter,
+        ensemble: SignalEnsemble | None = None,
+        news_signal: NewsSignal | None = None,
+        onchain_signal: OnChainSignal | None = None,
     ) -> None:
         self._reader = reader
         self._writer = writer
+        self._ensemble = ensemble
+        self._news_signal = news_signal
+        self._onchain_signal = onchain_signal
 
     # ------------------------------------------------------------------
     # API principal — llamada por el connector
@@ -87,11 +99,19 @@ class FeatureStore:
             True si se calcularon y persistieron features,
             False si no había datos suficientes.
         """
+        news_val = self._news_signal.get(market_id) if self._news_signal else 0.0
+        onchain_val = (
+            self._onchain_signal.get(condition_id=market_id) if self._onchain_signal else 0.0
+        )
+
         row = compute_features_from_db(
             market_id=market_id,
             reader=self._reader,
             tau_years=tau_years,
             ewma_window=ewma_window,
+            ensemble=self._ensemble,
+            news=news_val,
+            onchain=onchain_val,
         )
 
         if row is None:
@@ -100,10 +120,10 @@ class FeatureStore:
 
         self._writer.write_features_sync([row])
         log.debug(
-            "Features stored: %s | obi=%.3f bernoulli_vol=%.4f tau=%.4f",
+            "Features stored: %s | obi=%.3f belief_vol=%.4f tau=%.4f",
             market_id,
             row.get("obi", 0),
-            row.get("bernoulli_vol") or 0,
+            row.get("belief_vol") or 0,
             tau_years,
         )
         return True
@@ -127,10 +147,18 @@ class FeatureStore:
         rows = []
         for market in markets:
             tau = market.resolution.tau
+            mid = str(market.market_id)
+            news_val = self._news_signal.get(mid) if self._news_signal else 0.0
+            onchain_val = (
+                self._onchain_signal.get(condition_id=mid) if self._onchain_signal else 0.0
+            )
             row = compute_features_from_db(
-                market_id=str(market.market_id),
+                market_id=mid,
                 reader=self._reader,
                 tau_years=tau,
+                ensemble=self._ensemble,
+                news=news_val,
+                onchain=onchain_val,
             )
             if row is not None:
                 rows.append(row)
@@ -199,7 +227,7 @@ class FeatureStore:
         Devuelve las features más recientes de un mercado como dict.
 
         Usado por el execution engine antes de calcular quotes —
-        necesita OBI, bernoulli_vol y tau_years en formato nativo
+        necesita OBI, belief_vol y tau_years en formato nativo
         sin pasar por pandas.
 
         Returns:
@@ -220,9 +248,7 @@ class FeatureStore:
             "relative_spread": float(row["relative_spread"])
             if row["relative_spread"] is not None
             else None,
-            "bernoulli_vol": float(row["bernoulli_vol"])
-            if row["bernoulli_vol"] is not None
-            else None,
+            "belief_vol": float(row["belief_vol"]) if row["belief_vol"] is not None else None,
             "ewma_vol": float(row["ewma_vol"]) if row["ewma_vol"] is not None else 0.0,
             "tau_years": float(row["tau_years"]) if row["tau_years"] is not None else 0.0,
             "mu_hat": float(row["mu_hat"]) if row["mu_hat"] is not None else 0.0,

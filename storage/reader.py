@@ -108,7 +108,7 @@ class MarketDataReader:
         return self._con.execute(
             """
             SELECT timestamp, obi, quoted_spread, relative_spread,
-                   bernoulli_vol, ewma_vol, tau_years, mu_hat
+                   belief_vol, ewma_vol, tau_years, mu_hat
             FROM   features
             WHERE  market_id = ?
             ORDER  BY timestamp DESC
@@ -315,7 +315,7 @@ class MarketDataReader:
         return self._con.execute(
             f"""
             SELECT timestamp, obi, quoted_spread, relative_spread,
-                   bernoulli_vol, ewma_vol, tau_years, mu_hat
+                   belief_vol, ewma_vol, tau_years, mu_hat
             FROM   features
             WHERE  {where}
             ORDER  BY timestamp ASC

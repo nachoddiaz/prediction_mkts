@@ -21,8 +21,6 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from features.microstructure import (
-    bernoulli_vol,
-    bernoulli_vol_from_tick,
     compute_features_batch,
     compute_features_from_db,
     ewma_vol,
@@ -188,36 +186,10 @@ class TestSpreads:
         assert relative_spread(ob) is None
 
 
-class TestBernoulliVol:
-    def test_maximo_en_05(self) -> None:
-        tau = 30 / 365.25
-        assert bernoulli_vol(0.5, tau) > bernoulli_vol(0.4, tau)
-        assert bernoulli_vol(0.5, tau) > bernoulli_vol(0.6, tau)
-
-    def test_simetrica(self) -> None:
-        tau = 30 / 365.25
-        assert bernoulli_vol(0.3, tau) == pytest.approx(bernoulli_vol(0.7, tau))
-
-    def test_crece_al_reducir_tau(self) -> None:
-        p = 0.5
-        assert bernoulli_vol(p, 1 / 365.25) > bernoulli_vol(p, 7 / 365.25)
-        assert bernoulli_vol(p, 7 / 365.25) > bernoulli_vol(p, 30 / 365.25)
-
-    def test_tau_cero_inf(self) -> None:
-        assert bernoulli_vol(0.5, 0.0) == math.inf
-
-    def test_p_extremos_cero(self) -> None:
-        assert bernoulli_vol(0.0, 30 / 365.25) == 0.0
-        assert bernoulli_vol(1.0, 30 / 365.25) == 0.0
-
-    def test_formula_exacta(self) -> None:
-        vol = bernoulli_vol(0.5, 1 / 365.25)
-        assert vol == pytest.approx(math.sqrt(0.25 * 365.25), rel=1e-4)
-
-    def test_from_tick(self) -> None:
-        tick = make_tick(bid=0.44, ask=0.46)  # mid = 0.45
-        tau = 30 / 365.25
-        assert bernoulli_vol_from_tick(tick, tau) == pytest.approx(bernoulli_vol(0.45, tau))
+# ELIMINADO: TestBernoulliVol — función obsoleta según MATH.md v2.1
+# La volatilidad ahora se calcula desde variación cuadrática de logit(p)
+# usando belief_vol_from_ticks(), no analíticamente desde p y τ.
+# Ver tests de belief_vol_from_ticks más abajo (si existen).
 
 
 # ---------------------------------------------------------------------------
@@ -361,7 +333,7 @@ class TestComputeFeaturesFromDB:
             "obi",
             "quoted_spread",
             "relative_spread",
-            "bernoulli_vol",
+            "belief_vol",
             "ewma_vol",
             "tau_years",
             "mu_hat",
@@ -378,13 +350,13 @@ class TestComputeFeaturesFromDB:
         assert result["obi"] > 0
         db.close()
 
-    def test_mayor_tau_menor_bernoulli_vol(self) -> None:
+    def test_belief_vol_positivo(self) -> None:
+        """belief_vol debe ser > 0 si hay suficientes ticks."""
         db = DB()
         self._populate(db)
         r1 = compute_features_from_db("kalshi:KXBTC-TEST", db.r, tau_years=1.0)
-        r2 = compute_features_from_db("kalshi:KXBTC-TEST", db.r, tau_years=0.1)
-        assert r1 is not None and r2 is not None
-        assert r1["bernoulli_vol"] < r2["bernoulli_vol"]
+        assert r1 is not None
+        assert r1["belief_vol"] > 0.0
         db.close()
 
     def test_none_si_sin_datos(self) -> None:

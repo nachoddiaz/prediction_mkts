@@ -269,7 +269,7 @@ class TestSyncAPI:
                     "obi": 0.234,
                     "quoted_spread": 0.020,
                     "relative_spread": 4.44,
-                    "bernoulli_vol": 0.0147,
+                    "belief_vol": 0.0147,
                     "ewma_vol": 0.0089,
                     "tau_years": 0.0001,
                     "mu_hat": 0.012,

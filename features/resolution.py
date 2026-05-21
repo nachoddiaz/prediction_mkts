@@ -152,39 +152,48 @@ def compute_resolution_features(
     tau_minutes = delta_seconds / 60
 
     # --- Determinar régimen según §6.4 del MATH.md ---
+    # Parámetros para q_max exponencial (§8.3 MATH.md v2.1)
+    # q_max = Q_0 * exp(-r * psi(tau)) donde psi(tau) = exp(-tau/tau_star)
+    # r: probabilidad de reversal del oracle (típico 0.001-0.01)
+    # tau_star: escala temporal característica (típico 24h)
+    r_oracle = 0.001  # TODO: mover a config
+    tau_star = TAU_24H  # 24 horas
+    psi_tau = math.exp(-tau_years / tau_star)
+    q_max_fraction_exp = math.exp(-r_oracle * psi_tau)
+
     if tau_years < TAU_5MIN:
         # τ < 5min: halt total
         # Informed traders dominan el libro (α → 1 en Glosten-Milgrom)
-        # σ_B diverge — ningún spread óptimo es calculable
+        # σ_b diverge — ningún spread óptimo es calculable
         regime = NearResolutionRegime.HALT
         gamma_multiplier = 4.0  # no se usa pero refleja el riesgo extremo
-        q_max_fraction = 0.0  # no abrir posiciones nuevas
+        q_max_fraction = 0.0  # no abrir posiciones nuevas (override exponencial)
         should_halt = True
         should_halt_side = True
 
     elif tau_years < TAU_1H:
         # 5min ≤ τ < 1h: crítico
-        # Inventario máximo = 1 contrato, halt en el lado pesado
+        # Inventario máximo reducido exponencialmente
         regime = NearResolutionRegime.CRITICAL
         gamma_multiplier = 4.0  # γ_effective = 4γ
-        q_max_fraction = 0.1  # máximo 10% del Q normal
+        q_max_fraction = min(0.1, q_max_fraction_exp)  # exponencial limitado al 10%
         should_halt = False
         should_halt_side = True  # halt en el lado con inventario
 
     elif tau_years < TAU_24H:
         # 1h ≤ τ < 24h: warning
-        # Reducir Q_max a la mitad, doblar γ
+        # Decaimiento exponencial de Q_max según §8.3 v2.1
         regime = NearResolutionRegime.WARNING
         gamma_multiplier = 2.0  # γ_effective = 2γ del §6.4
-        q_max_fraction = 0.5  # Q_max = Q/2 del §6.4
+        q_max_fraction = min(0.5, q_max_fraction_exp)  # exponencial limitado al 50%
         should_halt = False
         should_halt_side = False
 
     else:
-        # τ ≥ 24h: operación normal
+        # τ ≥ 24h: operación normal con decaimiento exponencial suave
         regime = NearResolutionRegime.NORMAL
         gamma_multiplier = 1.0
-        q_max_fraction = 1.0
+        q_max_fraction = q_max_fraction_exp  # fórmula exponencial pura
         should_halt = False
         should_halt_side = False
 
@@ -240,30 +249,9 @@ def effective_q_max(q_max: float, rf: ResolutionFeatures) -> float:
     return q_max * rf.q_max_fraction
 
 
-def bernoulli_vol_safe(p: float, rf: ResolutionFeatures) -> float:
-    """
-    σ_B(p, τ) con manejo seguro de near-resolution.
-
-    En HALT y RESOLVED tau es 0 o muy pequeño — σ_B diverge.
-    En lugar de devolver inf (que rompería los cálculos del GLFT),
-    devolvemos un valor máximo práctico que indica "no cotices".
-
-    Por qué 100.0 como máximo:
-      Un spread óptimo calculado con σ_B = 100 sería mayor que 1.0
-      (el rango completo del contrato). El execution engine lo
-      interpretaría como "no hay spread viable" y no cotizaría.
-
-    Args:
-        p:  probabilidad implícita del contrato ∈ (0, 1)
-        rf: ResolutionFeatures ya calculadas
-
-    Returns:
-        σ_B como float, máximo 100.0 en near-resolution extremo
-    """
-    if rf.regime in (NearResolutionRegime.HALT, NearResolutionRegime.RESOLVED):
-        return 100.0
-
-    if rf.tau_years <= 1e-9 or not (0.0 < p < 1.0):
-        return 100.0
-
-    return math.sqrt(p * (1.0 - p) / rf.tau_years)
+# ELIMINADO: bernoulli_vol_safe — función obsoleta según MATH.md v2.1
+# La volatilidad ahora es σ_b calibrada desde variación cuadrática de logit(p),
+# no calculada analíticamente desde p y τ.
+# El execution engine debe usar belief_vol_from_ticks() de microstructure.py
+# y respetar los flags should_halt y should_halt_side en lugar de depender
+# de un valor centinela arbitrario (100.0).
