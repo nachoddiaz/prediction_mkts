@@ -33,6 +33,8 @@ venv/
 .coverage.*
 htmlcov/
 coverage.xml
+.agents/
+.claude/
 
 # ---------------------------------------------------------------------------
 # Data — the directory layout is preserved through data/.gitignore
