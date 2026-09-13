@@ -1,7 +1,7 @@
 """
 execution/paper/account.py
 ──────────────────────────
-Cuenta simulada para paper trading.
+Simulated account for paper trading.
 """
 
 from __future__ import annotations
@@ -18,13 +18,13 @@ log = logging.getLogger(__name__)
 
 class PaperAccount:
     """
-    Gestiona el saldo de caja y las posiciones simuladas en papel.
+    Manages the cash balance and the simulated paper positions.
 
-    Por qué saldo de caja y posición de YES con signo:
-      En teoría de MM, mantener una posición negativa en YES es equivalente
-      a mantener una posición positiva en NO. Al modelarlo como un float con
-      signo de YES (q_t ∈ ℝ), simplificamos las ecuaciones de inventario y
-      mantenemos compatibilidad directa con los quoters de GLFT y CJ.
+    Why a cash balance plus a signed YES position:
+      In market-making theory, a negative YES position is equivalent to a
+      positive NO position. Modelling it as a signed float on YES (q_t ∈ ℝ)
+      simplifies the inventory equations and keeps direct compatibility with
+      the GLFT and CJ quoters.
     """
 
     def __init__(self, initial_cash: float = 10000.0) -> None:
@@ -34,33 +34,33 @@ class PaperAccount:
 
     @property
     def cash_balance(self) -> float:
-        """Saldo de caja actual (simulado)."""
+        """The current (simulated) cash balance."""
         return self._cash_balance
 
     @property
     def positions(self) -> dict[MarketId, float]:
-        """Diccionario de posiciones de YES firmadas por mercado."""
+        """Signed YES positions, keyed by market."""
         return self._positions.copy()
 
     @property
     def orders(self) -> dict[str, Order]:
-        """Diccionario de todas las órdenes por order_id."""
+        """All orders, keyed by order_id."""
         return self._orders.copy()
 
     def get_position(self, market_id: MarketId) -> float:
-        """Retorna la posición neta (firmada) de YES en un mercado."""
+        """Net signed YES position in a market."""
         return self._positions.get(market_id, 0.0)
 
     def get_balance(self) -> float:
-        """Retorna el saldo de caja."""
+        """Current cash balance."""
         return self._cash_balance
 
     def get_active_orders(self, market_id: MarketId | None = None) -> list[Order]:
         """
-        Retorna las órdenes activas en el sistema.
+        Return the resting orders in the system.
 
         Args:
-            market_id: Opcional. Si se proporciona, filtra solo las de ese mercado.
+            market_id: optional; when given, filters to that market only.
         """
         active = [o for o in self._orders.values() if o.is_active]
         if market_id:
@@ -76,7 +76,7 @@ class PaperAccount:
         outcome: Side = Side.YES,
     ) -> Order:
         """
-        Crea y registra una nueva orden en estado PENDING.
+        Create and register a new order in PENDING state.
         """
         order_id = f"paper_{uuid.uuid4().hex[:8]}"
         now = datetime.now(UTC)
@@ -104,10 +104,10 @@ class PaperAccount:
 
     def cancel_order(self, order_id: str) -> bool:
         """
-        Cancela una orden activa.
+        Cancel a resting order.
 
         Returns:
-            True si la orden fue cancelada con éxito, False si no era cancelable.
+            True when the order was cancelled, False when it was not cancellable.
         """
         order = self._orders.get(order_id)
         if not order or not order.is_active:
@@ -121,12 +121,12 @@ class PaperAccount:
 
     def fill_order(self, order_id: str, fill_size: Size, fill_price: Price) -> Order | None:
         """
-        Ejecuta un fill parcial o total sobre una orden activa.
+        Apply a partial or complete fill to a resting order.
 
-        Actualiza el estado de la orden, el saldo de caja y la posición de YES.
+        Updates the order state, the cash balance and the YES position.
 
         Returns:
-            La orden modificada, o None si no se pudo aplicar el fill.
+            The modified order, or None when the fill could not be applied.
         """
         order = self._orders.get(order_id)
         if not order or not order.is_active:
@@ -140,20 +140,20 @@ class PaperAccount:
             )
             return None
 
-        # Asegurar no sobrepasar el tamaño restante
+        # Never exceed the remaining size
         fill_size = Size(min(fill_size, order.remaining_size))
 
         order.filled_size = Size(order.filled_size + fill_size)
-        if order.remaining_size == 0:
+        if float(order.remaining_size) == 0.0:
             order.status = OrderStatus.FILLED
         else:
             order.status = OrderStatus.ACTIVE
 
         order.updated_at = datetime.now(UTC)
 
-        # Actualizar balances según la acción
-        # Compra de YES: reduce caja, aumenta posición
-        # Venta de YES: aumenta caja, reduce posición
+        # Update balances according to the action
+        # Buying YES: reduces cash, increases the position
+        # Selling YES: increases cash, reduces the position
         if order.action == OrderAction.BUY:
             self._cash_balance -= float(fill_size * fill_price)
             self._positions[order.market_id] = self._positions.get(order.market_id, 0.0) + float(

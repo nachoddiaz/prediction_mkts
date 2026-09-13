@@ -1,24 +1,24 @@
 """
 features/resolution.py
 ───────────────────────
-Cálculo de tau y flags de near-resolution.
+Computation of tau and the near-resolution flags.
 
-Por qué este archivo separado de microstructure.py:
-  tau es un input de casi todas las fórmulas del MATH.md — GLFT,
-  Cartea-Jaimungal, Bernoulli vol, Kelly. Es tan fundamental que
-  merece su propio módulo, separado de las señales de microestructura
-  que dependen del orderbook.
+Why this file is separate from microstructure.py:
+  tau is an input to nearly every formula in MATH.md — GLFT,
+  Cartea-Jaimungal, belief volatility, Kelly. It is fundamental enough to
+  deserve its own module, separate from the microstructure signals that
+  depend on the order book.
 
-  Además, los near-resolution flags son reglas de negocio que
-  afectan al execution engine (circuit breakers), no son features
-  de trading. Tenerlos aquí hace explícita esa distinción.
+  The near-resolution flags are business rules that belong alongside it: they
+  drive the execution engine (circuit breakers) rather than being trading
+  features. Keeping them here makes that distinction explicit.
 
-Relación con el MATH.md:
-  - tau              → τ = T - t en años, aparece en todas las fórmulas
-  - σ_B(p, τ)        → usa tau directamente
-  - reservation price → p̃ = p - q·γ·p(1-p) [τ se cancela con σ_B]
+Relation to MATH.md:
+  - tau              → τ = T - t in years, appearing in every formula
+  - σ_B(p, τ)        → uses tau directly
+  - reservation price → p̃ = p - q·γ·p(1-p) [τ cancels against σ_B]
   - signal skew      → φ₁(t) = (ρση/φ)(1 - e^{-φτ})
-  - near-resolution  → §6.4: reglas de halt quoting
+  - near-resolution  → §6.4: quoting-halt rules
 """
 
 from __future__ import annotations
@@ -29,31 +29,30 @@ from datetime import UTC, datetime
 from enum import Enum
 
 # ---------------------------------------------------------------------------
-# Umbrales de near-resolution — del §6.4 del MATH.md
+# Near-resolution thresholds — from MATH.md §6.4
 #
-# Por qué estos valores concretos:
-#   24h: el riesgo de inventario empieza a ser significativo.
-#        γ_effective = 2γ y Q_max = Q/2.
-#   1h:  la vol de Bernoulli empieza a divergir rápidamente.
-#        Solo se admite 1 contrato de inventario máximo.
-#   5min: near-resolution extremo. El libro está dominado por
-#         informed traders (α → 1 en Glosten-Milgrom).
-#         Halt total de quoting.
+# Why these specific values:
+#   24h: inventory risk starts to become significant.
+#        γ_effective = 2γ and Q_max = Q/2.
+#   1h:  Bernoulli volatility starts to diverge quickly.
+#        At most 1 contract of inventory is admitted.
+#   5 min: extreme near resolution. The book is dominated by informed flow
+#        (α → 1 in Glosten-Milgrom). Quoting halts entirely.
 # ---------------------------------------------------------------------------
-TAU_24H = 24.0 / (365.25 * 24)  # 24 horas en años
-TAU_1H = 1.0 / (365.25 * 24)  # 1 hora en años
-TAU_5MIN = 5.0 / (365.25 * 24 * 60)  # 5 minutos en años
+TAU_24H = 24.0 / (365.25 * 24)  # 24 hours, in years
+TAU_1H = 1.0 / (365.25 * 24)  # 1 hour, in years
+TAU_5MIN = 5.0 / (365.25 * 24 * 60)  # 5 minutes, in years
 
 
 class NearResolutionRegime(str, Enum):
     """
-    Régimen de near-resolution según §6.4 del MATH.md.
+    Near-resolution regime, per MATH.md §6.4.
 
-    NORMAL      → τ ≥ 24h. Sistema opera con parámetros normales.
-    WARNING     → 1h ≤ τ < 24h. Reducir inventario máximo, doblar γ.
-    CRITICAL    → 5min ≤ τ < 1h. Inventario máximo = 1, halt un lado.
-    HALT        → τ < 5min. Halt total de quoting.
-    RESOLVED    → τ ≤ 0. El mercado ya ha resuelto.
+    NORMAL      → τ ≥ 24h. The system runs with normal parameters.
+    WARNING     → 1h ≤ τ < 24h. Reduce max inventory, double γ.
+    CRITICAL    → 5min ≤ τ < 1h. Max inventory = 1, halt one side.
+    HALT        → τ < 5min. Quoting halts entirely.
+    RESOLVED    → τ ≤ 0. The market has already resolved.
     """
 
     NORMAL = "normal"
@@ -63,25 +62,39 @@ class NearResolutionRegime(str, Enum):
     RESOLVED = "resolved"
 
 
+# Per-regime γ multipliers — MATH.md §6.4.
+# A single table: compute_resolution_features() and effective_gamma_for_regime()
+# read from here, so the two cannot drift apart.
+GAMMA_MULTIPLIER_BY_REGIME: dict[NearResolutionRegime, float] = {
+    NearResolutionRegime.NORMAL: 1.0,
+    NearResolutionRegime.WARNING: 2.0,
+    NearResolutionRegime.CRITICAL: 4.0,
+    # HALT and RESOLVED do not quote; the value reflects the extreme risk and
+    # keeps the function total over the enum.
+    NearResolutionRegime.HALT: 4.0,
+    NearResolutionRegime.RESOLVED: 1.0,
+}
+
+
 @dataclass(frozen=True)
 class ResolutionFeatures:
     """
-    Todas las features relacionadas con el tiempo hasta resolución.
+    Every feature derived from the time remaining to resolution.
 
-    Por qué un dataclass frozen:
-      Igual que los objetos del dominio — inmutable una vez calculado.
-      Si necesitas nuevas features, crea un nuevo objeto.
+    Why a frozen dataclass:
+      Like the domain objects — immutable once computed. If you need new
+      features, build a new object.
 
-    Campos:
-      tau_years          → τ en años — input directo a todas las fórmulas
-      tau_days           → τ en días — para logging y dashboard
-      tau_hours          → τ en horas — para near-resolution decisions
-      tau_minutes        → τ en minutos — para halt decisions
-      regime             → NearResolutionRegime según §6.4
-      gamma_multiplier   → factor por el que multiplicar γ en el modelo
-      q_max_fraction     → fracción de Q_max permitida (1.0 = normal)
-      should_halt        → True si hay que detener todo quoting
-      should_halt_side   → True si hay que detener quoting en un lado
+    Fields:
+      tau_years          → τ in years — the direct input to every formula
+      tau_days           → τ in days, for logging and dashboards
+      tau_hours          → τ in hours, for near-resolution decisions
+      tau_minutes        → τ in minutes, for halt decisions
+      regime             → NearResolutionRegime per §6.4
+      gamma_multiplier   → factor by which to scale γ in the model
+      q_max_fraction     → fraction of Q_max permitted (1.0 = normal)
+      should_halt        → True when all quoting must stop
+      should_halt_side   → True when one side must stop quoting
     """
 
     tau_years: float
@@ -96,7 +109,7 @@ class ResolutionFeatures:
 
 
 # ---------------------------------------------------------------------------
-# Función principal
+# Main entry point
 # ---------------------------------------------------------------------------
 
 
@@ -105,25 +118,25 @@ def compute_resolution_features(
     now: datetime | None = None,
 ) -> ResolutionFeatures:
     """
-    Calcula todas las features de resolución dado la fecha de cierre.
+    Compute every resolution feature from the closing date.
 
-    Por qué recibir now como parámetro opcional:
-      En tests necesitamos controlar el tiempo para verificar que
-      los flags se activan en los umbrales correctos. Con now=None
-      usa datetime.now(UTC) en producción. Con now=<datetime> en tests
-      podemos simular cualquier momento sin mocks.
+    Why `now` is an optional parameter:
+      Tests need to control time in order to verify that the regime and the
+      flags switch at the right thresholds. With now=None it uses
+      datetime.now(UTC) in production; with now=<datetime> in tests we can
+      simulate any instant without mocks.
 
     Args:
-        resolution_date: fecha y hora de resolución del contrato (UTC)
-        now:             momento actual. None = datetime.now(UTC)
+        resolution_date: contract resolution date and time (UTC)
+        now:             the current instant. None = datetime.now(UTC)
 
     Returns:
-        ResolutionFeatures con tau y todos los flags calculados.
+        A ResolutionFeatures with tau and every flag computed.
     """
     if now is None:
         now = datetime.now(tz=UTC)
 
-    # Asegurar que ambos datetimes son UTC-aware
+    # Ensure both datetimes are UTC-aware
     if resolution_date.tzinfo is None:
         resolution_date = resolution_date.replace(tzinfo=UTC)
     if now.tzinfo is None:
@@ -132,7 +145,7 @@ def compute_resolution_features(
     # --- Calcular tau en distintas unidades ---
     delta_seconds = (resolution_date - now).total_seconds()
 
-    # Si el mercado ya resolvió, tau es 0 en todas las unidades
+    # Once the market has resolved, tau is 0 in every unit
     if delta_seconds <= 0:
         return ResolutionFeatures(
             tau_years=0.0,
@@ -140,7 +153,7 @@ def compute_resolution_features(
             tau_hours=0.0,
             tau_minutes=0.0,
             regime=NearResolutionRegime.RESOLVED,
-            gamma_multiplier=1.0,  # sin operaciones activas
+            gamma_multiplier=1.0,  # no active trading
             q_max_fraction=0.0,  # no abrir nuevas posiciones
             should_halt=True,
             should_halt_side=True,
@@ -151,49 +164,49 @@ def compute_resolution_features(
     tau_hours = delta_seconds / 3600
     tau_minutes = delta_seconds / 60
 
-    # --- Determinar régimen según §6.4 del MATH.md ---
-    # Parámetros para q_max exponencial (§8.3 MATH.md v2.1)
-    # q_max = Q_0 * exp(-r * psi(tau)) donde psi(tau) = exp(-tau/tau_star)
-    # r: probabilidad de reversal del oracle (típico 0.001-0.01)
-    # tau_star: escala temporal característica (típico 24h)
-    r_oracle = 0.001  # TODO: mover a config
-    tau_star = TAU_24H  # 24 horas
+    # --- Determine the regime per MATH.md §6.4 ---
+    # Parameters for the exponential q_max (MATH.md §6.3)
+    # q_max = Q_0 * exp(-r * psi(tau)) where psi(tau) = exp(-tau/tau_star)
+    # r: oracle reversal probability (typically 0.001-0.01)
+    # tau_star: characteristic time scale (typically 24h)
+    r_oracle = 0.001  # TODO: move to config
+    tau_star = TAU_24H  # 24 hours
     psi_tau = math.exp(-tau_years / tau_star)
     q_max_fraction_exp = math.exp(-r_oracle * psi_tau)
 
     if tau_years < TAU_5MIN:
-        # τ < 5min: halt total
-        # Informed traders dominan el libro (α → 1 en Glosten-Milgrom)
-        # σ_b diverge — ningún spread óptimo es calculable
+        # τ < 5min: full halt
+        # Informed traders dominate the book (α → 1 in Glosten-Milgrom)
+        # σ_b diverges — no optimal spread is computable
         regime = NearResolutionRegime.HALT
-        gamma_multiplier = 4.0  # no se usa pero refleja el riesgo extremo
-        q_max_fraction = 0.0  # no abrir posiciones nuevas (override exponencial)
+        gamma_multiplier = GAMMA_MULTIPLIER_BY_REGIME[regime]
+        q_max_fraction = 0.0  # open no new positions (overrides the exponential)
         should_halt = True
         should_halt_side = True
 
     elif tau_years < TAU_1H:
-        # 5min ≤ τ < 1h: crítico
-        # Inventario máximo reducido exponencialmente
+        # 5min ≤ τ < 1h: critical
+        # Max inventory reduced exponentially
         regime = NearResolutionRegime.CRITICAL
-        gamma_multiplier = 4.0  # γ_effective = 4γ
-        q_max_fraction = min(0.1, q_max_fraction_exp)  # exponencial limitado al 10%
+        gamma_multiplier = GAMMA_MULTIPLIER_BY_REGIME[regime]
+        q_max_fraction = min(0.1, q_max_fraction_exp)  # exponential capped at 10%
         should_halt = False
-        should_halt_side = True  # halt en el lado con inventario
+        should_halt_side = True  # halt the side carrying inventory
 
     elif tau_years < TAU_24H:
         # 1h ≤ τ < 24h: warning
-        # Decaimiento exponencial de Q_max según §8.3 v2.1
+        # Exponential decay of Q_max per §6.3
         regime = NearResolutionRegime.WARNING
-        gamma_multiplier = 2.0  # γ_effective = 2γ del §6.4
+        gamma_multiplier = GAMMA_MULTIPLIER_BY_REGIME[regime]
         q_max_fraction = min(0.5, q_max_fraction_exp)  # exponencial limitado al 50%
         should_halt = False
         should_halt_side = False
 
     else:
-        # τ ≥ 24h: operación normal con decaimiento exponencial suave
+        # τ ≥ 24h: normal operation with a smooth exponential decay
         regime = NearResolutionRegime.NORMAL
-        gamma_multiplier = 1.0
-        q_max_fraction = q_max_fraction_exp  # fórmula exponencial pura
+        gamma_multiplier = GAMMA_MULTIPLIER_BY_REGIME[regime]
+        q_max_fraction = q_max_fraction_exp  # the pure exponential formula
         should_halt = False
         should_halt_side = False
 
@@ -211,47 +224,69 @@ def compute_resolution_features(
 
 
 # ---------------------------------------------------------------------------
-# Helpers para uso directo desde el execution engine
+# Helpers for direct use from the execution engine
 # ---------------------------------------------------------------------------
+
+
+def effective_gamma_for_regime(gamma: float, regime: NearResolutionRegime) -> float:
+    """
+    γ_effective = γ · regime multiplier — MATH.md §6.4.
+
+    Why this variant in addition to effective_gamma(gamma, rf):
+      The quoters receive the resolved regime, not the full ResolutionFeatures.
+      Without this function they would have to recompute the features (and
+      with them a `now` different from the one that produced the regime), or —
+      as happened through v2.1 — ignore the multiplier entirely.
+
+    Args:
+        gamma:  the base risk aversion γ_I
+        regime: the near-resolution regime in force
+
+    Returns:
+        γ scaled: ×1 NORMAL, ×2 WARNING, ×4 CRITICAL.
+    """
+    if gamma <= 0:
+        raise ValueError(f"gamma must be positive, got {gamma}")
+    return gamma * GAMMA_MULTIPLIER_BY_REGIME[regime]
 
 
 def effective_gamma(gamma: float, rf: ResolutionFeatures) -> float:
     """
-    Devuelve γ_effective = γ · gamma_multiplier.
+    Return γ_effective = γ · gamma_multiplier.
 
-    Usado por GLFT y Cartea-Jaimungal para escalar la aversión
-    al riesgo según el régimen de near-resolution.
+    Used by GLFT and Cartea-Jaimungal to scale risk aversion according to the
+    near-resolution regime.
 
     Args:
-        gamma: coeficiente de aversión al riesgo base
-        rf:    ResolutionFeatures ya calculadas
+        gamma: the base risk-aversion coefficient
+        rf:    previously computed ResolutionFeatures
 
     Returns:
-        γ ajustado por el régimen actual
+        γ adjusted for the current regime
     """
     return gamma * rf.gamma_multiplier
 
 
 def effective_q_max(q_max: float, rf: ResolutionFeatures) -> float:
     """
-    Devuelve Q_max_effective = Q_max · q_max_fraction.
+    Return Q_max_effective = Q_max · q_max_fraction.
 
-    Usado por el risk manager para limitar el inventario
-    según el régimen de near-resolution.
+    Used by the risk manager to cap inventory according to the
+    near-resolution regime.
 
     Args:
-        q_max: límite de inventario máximo en condiciones normales
-        rf:    ResolutionFeatures ya calculadas
+        q_max: the maximum inventory limit under normal conditions
+        rf:    previously computed ResolutionFeatures
 
     Returns:
-        Q_max ajustado por el régimen actual
+        Q_max adjusted for the current regime
     """
     return q_max * rf.q_max_fraction
 
 
-# ELIMINADO: bernoulli_vol_safe — función obsoleta según MATH.md v2.1
-# La volatilidad ahora es σ_b calibrada desde variación cuadrática de logit(p),
-# no calculada analíticamente desde p y τ.
-# El execution engine debe usar belief_vol_from_ticks() de microstructure.py
-# y respetar los flags should_halt y should_halt_side en lugar de depender
-# de un valor centinela arbitrario (100.0).
+# REMOVED: bernoulli_vol_safe — obsolete under MATH.md v2.1.
+# Volatility is now σ_b, calibrated from the quadratic variation of logit(p),
+# rather than computed analytically from p and τ.
+# The execution engine must use belief_vol_from_ticks() from microstructure.py
+# and respect the should_halt and should_halt_side flags instead of relying on
+# an arbitrary sentinel value (100.0).

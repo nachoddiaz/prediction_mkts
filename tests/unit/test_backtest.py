@@ -1,7 +1,7 @@
 """
 tests/unit/test_backtest.py
 ───────────────────────────
-Tests unitarios para el framework de Backtesting.
+Unit tests for the backtesting framework.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ from storage.writer import MarketDataWriter
 
 
 def test_calculate_metrics_empty() -> None:
-    """Verifica que el cálculo con datos vacíos devuelva métricas inicializadas a cero."""
+    """With empty input the metrics must come back zero-initialised."""
     res = calculate_metrics(pd.DataFrame(), 10000.0)
     assert res["total_pnl"] == 0.0
     assert res["total_return_pct"] == 0.0
@@ -49,11 +49,11 @@ def test_calculate_metrics_empty() -> None:
 
 
 def test_calculate_metrics_synthetic() -> None:
-    """Verifica cálculos de rendimiento, drawdown y Sharpe con una traza sintética."""
-    # Simular 3 días de actividad con Close de Equity:
-    # Día 1: 10000 -> 10100
-    # Día 2: 10100 -> 9800  (drawdown respecto al pico de 10100)
-    # Día 3: 9800  -> 10500
+    """Return, drawdown and Sharpe computed over a synthetic trace."""
+    # Simulate 3 days of activity with equity closes:
+    #   Day 1: 10000 -> 10100
+    #   Day 2: 10100 -> 9800  (drawdown from the 10100 peak)
+    #   Day 3: 9800  -> 10500
     base_time = datetime(2026, 5, 20, 12, 0, tzinfo=UTC)
     records = [
         # t0
@@ -67,7 +67,7 @@ def test_calculate_metrics_synthetic() -> None:
             "action": "BUY",
             "order_status": "FILLED",
         },
-        # t1 (Día 1)
+        # t1 (day 1)
         {
             "timestamp": base_time + timedelta(days=1),
             "cash": 9950.0,
@@ -78,7 +78,7 @@ def test_calculate_metrics_synthetic() -> None:
             "action": None,
             "order_status": None,
         },
-        # t2 (Día 2)
+        # t2 (day 2)
         {
             "timestamp": base_time + timedelta(days=2),
             "cash": 9950.0,
@@ -89,7 +89,7 @@ def test_calculate_metrics_synthetic() -> None:
             "action": None,
             "order_status": None,
         },
-        # t3 (Día 3)
+        # t3 (day 3)
         {
             "timestamp": base_time + timedelta(days=3),
             "cash": 10500.0,
@@ -108,7 +108,7 @@ def test_calculate_metrics_synthetic() -> None:
     assert res["total_pnl"] == 500.0
     assert res["total_return_pct"] == 5.0
 
-    # Drawdown máximo
+    # Maximum drawdown
     # Peak = 10100. Trough = 9800. USD DD = 300. Pct DD = 300 / 10100 = 2.9703%
     assert res["max_drawdown_usd"] == pytest.approx(300.0)
     assert res["max_drawdown_pct"] == pytest.approx(300.0 / 10100.0 * 100.0, abs=1e-3)
@@ -120,7 +120,7 @@ def test_calculate_metrics_synthetic() -> None:
 
 @pytest.fixture
 def temp_db() -> str:
-    """Fixture que crea un archivo DuckDB temporal poblado con datos de prueba."""
+    """Fixture creating a temporary DuckDB file populated with test data."""
     fd, path = tempfile.mkstemp(suffix=".duckdb")
     os.close(fd)
     if os.path.exists(path):
@@ -128,7 +128,7 @@ def temp_db() -> str:
 
     writer = MarketDataWriter(path)
 
-    # 1. Crear mercados
+    # 1. Create markets
     mid = MarketId(Venue.MANIFOLD, "test_market")
     from normalizer.schema import Market
 
@@ -145,7 +145,7 @@ def temp_db() -> str:
 
     # 2. Escribir ticks (QUOTE y TRADE)
     ticks = []
-    # Generar algunos ticks a lo largo de 10 horas
+    # Generate a few ticks over 10 hours
     for i in range(20):
         t = base_time + timedelta(minutes=30 * i)
         # Algunos quotes
@@ -223,7 +223,7 @@ def from_tick_helper(
 
 
 def test_backtest_engine_runs_glft(temp_db: str) -> None:
-    """Verifica que el BacktestEngine se ejecute correctamente usando la estrategia GLFT."""
+    """The BacktestEngine runs correctly with the GLFT strategy."""
     engine = BacktestEngine(
         db_path=temp_db,
         market_id="manifold:test_market",
@@ -244,7 +244,7 @@ def test_backtest_engine_runs_glft(temp_db: str) -> None:
 
 def test_backtest_engine_runs_cj(temp_db: str) -> None:
     """
-    Verifica que el BacktestEngine se ejecute correctamente usando la estrategia
+    Verifies that the BacktestEngine runs correctly with the
     Cartea-Jaimungal.
     """
     engine = BacktestEngine(
@@ -253,10 +253,12 @@ def test_backtest_engine_runs_cj(temp_db: str) -> None:
         strategy_name="cartea_jaimungal",
         strategy_params={
             "gamma_I": 0.05,
-            "kappa_x": 1.2,
+            "kappa_x": 10.0,
             "phi": 2.0,
             "eta": 0.02,
-            "rho": -0.3,
+            # rho is ρ_μ ∈ (0,1] since v2.2 — the measure-change discount,
+            # not the price-signal correlation.
+            "rho": 0.3,
         },
         initial_cash=5000.0,
         order_size=1.0,
@@ -270,7 +272,7 @@ def test_backtest_engine_runs_cj(temp_db: str) -> None:
 
 
 def test_scenario_sweeps(temp_db: str) -> None:
-    """Verifica que el BaseScenario pueda realizar sweeps de parámetros sin errores."""
+    """BaseScenario can run parameter sweeps without error."""
     scenario = BaseScenario(db_path=temp_db, market_id="manifold:test_market")
 
     results = scenario.run_parameter_sweep(
@@ -284,15 +286,15 @@ def test_scenario_sweeps(temp_db: str) -> None:
     assert results[0]["sweep_value"] == 0.01
     assert results[1]["sweep_value"] == 0.05
     assert results[2]["sweep_value"] == 0.1
-    # Cada corrida debe contener las métricas esperadas
+    # Each run must contain the expected metrics
     assert "total_pnl" in results[0]
 
 
 def test_resolution_spike_scenario(temp_db: str) -> None:
-    """Verifica que el ResolutionSpikeScenario analice correctamente el periodo de cierre."""
+    """ResolutionSpikeScenario analyses the closing period correctly."""
     scenario = ResolutionSpikeScenario(db_path=temp_db, market_id="manifold:test_market")
 
-    # Simular periodo cercano al cierre (últimas 12 horas alineadas con base_time)
+    # Simulate a period close to expiry (the last 12 hours, aligned to base_time)
     base_time = datetime.now(tz=UTC) - timedelta(hours=12)
     res_time = base_time + timedelta(hours=10)
     metrics, trace_df = scenario.analyze_resolution_period(

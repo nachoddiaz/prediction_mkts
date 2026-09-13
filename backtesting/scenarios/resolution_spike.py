@@ -1,7 +1,7 @@
 """
 backtesting/scenarios/resolution_spike.py
 ──────────────────────────────────────────
-Escenario específico para simular el comportamiento cerca de la resolución (near-resolution).
+Scenario for simulating behaviour close to resolution.
 """
 
 from __future__ import annotations
@@ -21,12 +21,12 @@ log = logging.getLogger(__name__)
 
 class ResolutionSpikeScenario(BaseScenario):
     """
-    Simula e inspecciona el comportamiento del market maker en la fase final de resolución.
+    Simulates and inspects maker behaviour in the final phase before resolution.
 
-    Verifica que:
-      1. Se incrementen los spreads o se reduzca el inventario a medida que tau -> 0.
-      2. Se detenga el quoting (HALT) cuando faltan menos de 5 minutos (tau < TAU_5MIN).
-      3. No se violen los límites de riesgo dinámicos ante picos de volatilidad de cierre.
+    It verifies that:
+      1. Spreads widen, or inventory shrinks, as tau → 0.
+      2. Quoting halts below five minutes to resolution (tau < TAU_5MIN).
+      3. Dynamic risk limits are not breached under closing volatility spikes.
     """
 
     def analyze_resolution_period(
@@ -40,16 +40,16 @@ class ResolutionSpikeScenario(BaseScenario):
         risk_params: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], pd.DataFrame]:
         """
-        Ejecuta el backtest en la ventana temporal cercana a la resolución del mercado.
+        Run the backtest over the window leading up to resolution.
 
         Args:
-            strategy_name:    Nombre de la estrategia ('glft' o 'cartea_jaimungal')
-            strategy_params:  Parámetros de la estrategia
-            resolution_time:  Fecha/hora de resolución del mercado
-            hours_before:     Horas previas a la resolución para iniciar la simulación
-            initial_cash:     Caja inicial
-            order_size:       Tamaño de ordenes
-            risk_params:      Configuraciones de riesgo
+            strategy_name:    strategy name ('glft' or 'cartea_jaimungal')
+            strategy_params:  strategy parameters
+            resolution_time:  the market's resolution timestamp
+            hours_before:     hours before resolution at which to start
+            initial_cash:     starting cash
+            order_size:       order size
+            risk_params:      risk settings
         """
         # Asegurar timezones local/UTC
         if resolution_time.tzinfo is None:
@@ -79,16 +79,16 @@ class ResolutionSpikeScenario(BaseScenario):
 
     def _print_analysis_report(self, trace_df: pd.DataFrame, metrics: dict[str, Any]) -> None:
         """
-        Analiza e imprime el comportamiento de inventarios y spreads
-        durante la simulación de cierre.
+        Analyse and print inventory and spread behaviour through the closing
+        simulation.
         """
         console = Console()
         if trace_df.empty:
             console.print("[yellow]No data available for resolution analysis.[/yellow]")
             return
 
-        # Filtrar estados para verificar el comportamiento de halt y advertencias
-        # Identificar primera fila donde bid y ask quedaron cancelados (NaN)
+        # Filter states to verify halt and warning behaviour
+        # Identify the first row where bid and ask were both cancelled (NaN)
         halt_rows = trace_df[trace_df["bid_p"].isna() & trace_df["ask_p"].isna()]
 
         console.print("\n[bold cyan]=== Near-Resolution Analysis Report ===[/bold cyan]")
@@ -106,13 +106,13 @@ class ResolutionSpikeScenario(BaseScenario):
 
         console.print(summary_table)
 
-        # Verificar si ocurrió el HALT reglamentario
+        # Check whether the prescribed HALT occurred
         if not halt_rows.empty:
             first_halt_time = halt_rows["timestamp"].iloc[0]
             console.print(
                 f"[green]✔ Quoting Halt detected successfully at: {first_halt_time} UTC[/green]"
             )
-            # Calcular cuántas filas de datos se ejecutaron con halt
+            # Compute how many data rows ran under halt
             pct_halt = (len(halt_rows) / len(trace_df)) * 100.0
             console.print(
                 f"  Market was in HALT mode for [bold]{pct_halt:.1f}%[/bold]"
@@ -123,10 +123,8 @@ class ResolutionSpikeScenario(BaseScenario):
                 "[red]✘ Warning: No absolute Quoting Halt detected during the final period.[/red]"
             )
 
-        # Mostrar muestra de la evolución del spread e inventario
-        console.print(
-            "\n[bold]Evolución de spreads e inventarios durante las fases del cierre:[/bold]"
-        )
+        # Show a sample of how spread and inventory evolve
+        console.print("\n[bold]Spread and inventory evolution through the closing phases:[/bold]")
         sample_size = min(10, len(trace_df))
         step = max(1, len(trace_df) // sample_size)
         sample_df = trace_df.iloc[::step].head(sample_size)

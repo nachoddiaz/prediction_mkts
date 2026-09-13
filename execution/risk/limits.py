@@ -1,7 +1,7 @@
 """
 execution/risk/limits.py
 ─────────────────────────
-Verificaciones de límites de riesgo previas al envío de órdenes (pre-trade risk).
+Pre-trade risk limit checks, applied before an order is sent.
 """
 
 from __future__ import annotations
@@ -15,16 +15,16 @@ log = logging.getLogger(__name__)
 
 class RiskLimitsChecker:
     """
-    Realiza chequeos de límites individuales de órdenes antes de su inserción.
+    Per-order limit checks performed before insertion.
 
-    Límites validados:
-      1. Límite de Inventario Máximo Efectivo:
-         Evita enviar órdenes que lleven la posición neta más allá de Q_max_effective.
-         Q_max_effective puede ser dinámico si estamos en régimen near-resolution.
+    Limits validated:
+      1. Effective maximum inventory limit:
+         Prevents orders that would push the net position beyond
+         Q_max_effective, which is dynamic under near-resolution regimes.
 
-      2. Límites de precio razonable:
-         Los precios deben residir estrictamente en [0.0001, 0.9999] para evitar
-         errores de cálculo de logit o precios inválidos de las venues.
+      2. Sane price bounds:
+         Prices must lie strictly within [0.0001, 0.9999], to avoid logit
+         computation errors and prices the venues would reject.
     """
 
     def __init__(self, max_position_loss: float = 999999.0) -> None:
@@ -37,32 +37,32 @@ class RiskLimitsChecker:
         q_max_effective: float,
     ) -> tuple[bool, str]:
         """
-        Valida que una orden cumpla con los límites de riesgo.
+        Validate that an order satisfies the risk limits.
 
         Args:
-            order:            La orden a validar.
-            current_position: Posición firmada de YES actual para este mercado.
-            q_max_effective:  Límite de inventario efectivo configurado/calculado
-                              para este instante.
+            order:            the order to validate.
+            current_position: current signed YES position in this market.
+            q_max_effective:  the configured or computed effective inventory
+                              cap at this instant.
 
         Returns:
-            Tuple[bool, str] -> (True, "") si pasa, (False, razón) si se rechaza.
+            Tuple[bool, str] -> (True, "") if it passes, (False, reason) if rejected.
         """
-        # 1. Validar precio en rango seguro para evitar divisiones por cero en logit
+        # 1. Price within a safe range, avoiding division by zero in logit
         if not (0.0001 <= float(order.price) <= 0.9999):
             reason = f"Price {order.price} is outside safe limits [0.0001, 0.9999]"
             log.warning(f"pre_trade_risk_rejected: order_id={order.order_id}, reason={reason}")
             return False, reason
 
-        # 2. Validar límite de inventario firmado
+        # 2. Validate the signed inventory limit
         position_change = (
             float(order.size) if order.action == OrderAction.BUY else -float(order.size)
         )
         projected_position = current_position + position_change
 
         if abs(projected_position) > q_max_effective:
-            # Permitir si es una orden que reduce el riesgo
-            # (reduce el valor absoluto de la posición)
+            # Allow it when the order reduces risk
+            # (it reduces the absolute value of the position)
             if abs(projected_position) >= abs(current_position):
                 reason = (
                     f"Projected position {projected_position:+.1f} "

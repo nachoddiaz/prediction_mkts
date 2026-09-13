@@ -45,6 +45,7 @@ from normalizer.schema import (
     Venue,
 )
 from strategies.market_making.cartea_jaimungal import CarteaJaimungalQuoter
+from strategies.market_making.glft import DEFAULT_KAPPA_X
 
 # ---------------------------------------------------------------------------
 # Fallbacks for robustness (ensures tests run even with temporary API glitches)
@@ -94,6 +95,7 @@ def build_fallback_kalshi() -> tuple[Market, OrderBook]:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.live
 @pytest.mark.asyncio
 async def test_polymarket_execution_pipeline() -> None:
     print("\n" + "═" * 60)
@@ -153,6 +155,19 @@ async def test_polymarket_execution_pipeline() -> None:
                                     best_bid = max(0.0001, mid - 0.001)
                                     best_ask = min(0.9999, mid + 0.001)
 
+                                # Only markets inside the quotable band.
+                                #
+                                # Polymarket allows 0.001 granularity and is
+                                # full of long shots at 0.002/0.003. With TICK
+                                # pinned to 0.01 the tick floor would push our
+                                # bid to 0.0100 — above the book's ask — and
+                                # the quoter rightly invalidates it. Letting
+                                # this test pick such a market was a lottery:
+                                # it measured sampling luck, not the pipeline.
+                                if not (0.05 <= (best_bid + best_ask) / 2 <= 0.95):
+                                    market = None
+                                    continue
+
                                 ob = OrderBook(
                                     market_id=market.market_id,
                                     timestamp=datetime.now(UTC),
@@ -190,7 +205,11 @@ async def test_polymarket_execution_pipeline() -> None:
     )
 
     # 3. Setup CarteaJaimungalQuoter
-    quoter = CarteaJaimungalQuoter(gamma_I=0.08, kappa_x=1.5, phi=1.0, eta=0.05, rho=0.2)
+    # kappa_x=1.5 gave a half-spread of 0.65 nats (a 31c spread) under the
+    # exact rent term of v2.2. See DEFAULT_KAPPA_X in glft.py.
+    quoter = CarteaJaimungalQuoter(
+        gamma_I=0.08, kappa_x=DEFAULT_KAPPA_X, phi=1.0, eta=0.05, rho=0.2
+    )
 
     # 4. Perform quoting cycle (router.on_quote)
     router.mid_prices[market.market_id] = ob.mid
@@ -272,6 +291,7 @@ async def test_polymarket_execution_pipeline() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.live
 @pytest.mark.asyncio
 async def test_kalshi_execution_pipeline() -> None:
     print("\n" + "═" * 60)
@@ -341,7 +361,11 @@ async def test_kalshi_execution_pipeline() -> None:
     )
 
     # 3. Setup CarteaJaimungalQuoter
-    quoter = CarteaJaimungalQuoter(gamma_I=0.08, kappa_x=1.5, phi=1.0, eta=0.05, rho=0.2)
+    # kappa_x=1.5 gave a half-spread of 0.65 nats (a 31c spread) under the
+    # exact rent term of v2.2. See DEFAULT_KAPPA_X in glft.py.
+    quoter = CarteaJaimungalQuoter(
+        gamma_I=0.08, kappa_x=DEFAULT_KAPPA_X, phi=1.0, eta=0.05, rho=0.2
+    )
 
     # 4. Perform quoting cycle (router.on_quote)
     router.mid_prices[market.market_id] = ob.mid

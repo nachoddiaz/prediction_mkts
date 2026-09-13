@@ -3,12 +3,11 @@ tests/unit/test_resolution.py
 ───────────────────────────────
 Tests de features/resolution.py.
 
-Por qué controlamos 'now' en todos los tests:
-  compute_resolution_features() usa datetime.now(UTC) por defecto.
-  Si los tests usaran el tiempo real, serían no-deterministas —
-  el mismo test podría pasar hoy y fallar mañana si resolution_date
-  queda en el pasado. Pasando now explícitamente, los tests son
-  completamente deterministas independientemente de cuándo se ejecuten.
+Why 'now' is controlled in every test:
+  If the tests used real time they would be non-deterministic — the same test
+  could pass today and fail tomorrow once resolution_date fell into the past.
+  Passing `now` explicitly makes the tests fully deterministic regardless of
+  when they run.
 """
 
 from __future__ import annotations
@@ -39,13 +38,13 @@ def resolution_in(
     hours: float = 0,
     minutes: float = 0,
 ) -> datetime:
-    """Construye una fecha de resolución a N tiempo desde NOW."""
+    """Build a resolution date N time units from now."""
     delta = timedelta(days=days, hours=hours, minutes=minutes)
     return NOW + delta
 
 
 # ---------------------------------------------------------------------------
-# Tests — régimen NORMAL (τ ≥ 24h)
+# Tests — NORMAL regime (τ ≥ 24h)
 # ---------------------------------------------------------------------------
 
 
@@ -54,19 +53,19 @@ class TestNormal:
         rf = compute_resolution_features(resolution_in(days=30), now=NOW)
         assert rf.regime == NearResolutionRegime.NORMAL
 
-    def test_tau_years_correcto(self) -> None:
+    def test_tau_years_is_correct(self) -> None:
         rf = compute_resolution_features(resolution_in(days=365), now=NOW)
         assert rf.tau_years == pytest.approx(1.0, rel=1e-2)
 
-    def test_tau_dias_correcto(self) -> None:
+    def test_tau_days_is_correct(self) -> None:
         rf = compute_resolution_features(resolution_in(days=7), now=NOW)
         assert rf.tau_days == pytest.approx(7.0, rel=1e-3)
 
-    def test_tau_horas_correcto(self) -> None:
+    def test_tau_hours_is_correct(self) -> None:
         rf = compute_resolution_features(resolution_in(hours=48), now=NOW)
         assert rf.tau_hours == pytest.approx(48.0, rel=1e-3)
 
-    def test_sin_halt(self) -> None:
+    def test_no_halt(self) -> None:
         rf = compute_resolution_features(resolution_in(days=30), now=NOW)
         assert not rf.should_halt
         assert not rf.should_halt_side
@@ -81,7 +80,7 @@ class TestNormal:
 
 
 # ---------------------------------------------------------------------------
-# Tests — régimen WARNING (1h ≤ τ < 24h)
+# Tests — WARNING regime (1h ≤ τ < 24h)
 # ---------------------------------------------------------------------------
 
 
@@ -90,8 +89,8 @@ class TestWarning:
         rf = compute_resolution_features(resolution_in(hours=12), now=NOW)
         assert rf.regime == NearResolutionRegime.WARNING
 
-    def test_regime_warning_justo_en_umbral(self) -> None:
-        """Exactamente en 24h debe ser WARNING, no NORMAL."""
+    def test_regime_warning_exactly_at_threshold(self) -> None:
+        """Exactly at 24h it must be WARNING, not NORMAL."""
         rf = compute_resolution_features(resolution_in(hours=23, minutes=59), now=NOW)
         assert rf.regime == NearResolutionRegime.WARNING
 
@@ -105,14 +104,14 @@ class TestWarning:
         rf = compute_resolution_features(resolution_in(hours=12), now=NOW)
         assert rf.q_max_fraction == pytest.approx(0.5)
 
-    def test_sin_halt(self) -> None:
+    def test_no_halt(self) -> None:
         rf = compute_resolution_features(resolution_in(hours=12), now=NOW)
         assert not rf.should_halt
         assert not rf.should_halt_side
 
 
 # ---------------------------------------------------------------------------
-# Tests — régimen CRITICAL (5min ≤ τ < 1h)
+# Tests — CRITICAL regime (5min ≤ τ < 1h)
 # ---------------------------------------------------------------------------
 
 
@@ -122,7 +121,7 @@ class TestCritical:
         assert rf.regime == NearResolutionRegime.CRITICAL
 
     def test_halt_side_activo(self) -> None:
-        """§6.4: en CRITICAL se para el lado con inventario."""
+        """§6.4: under CRITICAL the inventory-adding side is halted."""
         rf = compute_resolution_features(resolution_in(minutes=30), now=NOW)
         assert not rf.should_halt
         assert rf.should_halt_side
@@ -137,7 +136,7 @@ class TestCritical:
 
 
 # ---------------------------------------------------------------------------
-# Tests — régimen HALT (τ < 5min)
+# Tests — HALT regime (τ < 5min)
 # ---------------------------------------------------------------------------
 
 
@@ -158,17 +157,17 @@ class TestHalt:
 
 
 # ---------------------------------------------------------------------------
-# Tests — régimen RESOLVED (τ ≤ 0)
+# Tests — RESOLVED regime (τ ≤ 0)
 # ---------------------------------------------------------------------------
 
 
 class TestResolved:
-    def test_regime_resolved_en_pasado(self) -> None:
+    def test_regime_resolved_in_the_past(self) -> None:
         past = NOW - timedelta(days=1)
         rf = compute_resolution_features(past, now=NOW)
         assert rf.regime == NearResolutionRegime.RESOLVED
 
-    def test_tau_cero_en_pasado(self) -> None:
+    def test_zero_tau_in_the_past(self) -> None:
         past = NOW - timedelta(hours=1)
         rf = compute_resolution_features(past, now=NOW)
         assert rf.tau_years == 0.0
@@ -176,26 +175,26 @@ class TestResolved:
         assert rf.tau_hours == 0.0
         assert rf.tau_minutes == 0.0
 
-    def test_halt_total_en_resolved(self) -> None:
+    def test_full_halt_when_resolved(self) -> None:
         past = NOW - timedelta(days=1)
         rf = compute_resolution_features(past, now=NOW)
         assert rf.should_halt
         assert rf.q_max_fraction == 0.0
 
-    def test_exactamente_en_resolution_date(self) -> None:
-        """Exactamente en el momento de resolución → RESOLVED."""
+    def test_exactly_at_resolution_date(self) -> None:
+        """Exactly at the resolution instant → RESOLVED."""
         rf = compute_resolution_features(NOW, now=NOW)
         assert rf.regime == NearResolutionRegime.RESOLVED
 
 
 # ---------------------------------------------------------------------------
-# Tests — transiciones entre regímenes
+# Tests — transitions between regimes
 # ---------------------------------------------------------------------------
 
 
 class TestTransiciones:
     def test_transicion_normal_warning(self) -> None:
-        """Un tick antes de 24h es WARNING, un tick después es NORMAL."""
+        """One tick before 24h is WARNING, one tick after is NORMAL."""
         antes = compute_resolution_features(resolution_in(hours=23, minutes=59), now=NOW)
         despues = compute_resolution_features(resolution_in(hours=24, minutes=1), now=NOW)
         assert antes.regime == NearResolutionRegime.WARNING
@@ -246,6 +245,6 @@ class TestHelpers:
         rf = compute_resolution_features(resolution_in(minutes=1), now=NOW)
         assert effective_q_max(100.0, rf) == pytest.approx(0.0)
 
-    # ELIMINADO: tests de bernoulli_vol_safe — función obsoleta según MATH.md v2.1
-    # La volatilidad ahora se calcula desde variación cuadrática de logit(p)
-    # usando belief_vol_from_ticks(), no analíticamente desde p y τ.
+    # REMOVED: bernoulli_vol_safe tests — obsolete under MATH.md v2.1.
+    # Volatility is now computed from the quadratic variation of logit(p)
+    # via belief_vol_from_ticks(), not analytically from p and τ.

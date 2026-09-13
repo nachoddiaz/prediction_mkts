@@ -2,8 +2,8 @@
 """
 run_backtest.py
 ────────────────
-Script interactivo CLI para ejecutar simulaciones de Backtesting,
-sweeps de parámetros y análisis de near-resolution.
+Interactive CLI for running backtest simulations, parameter sweeps and
+near-resolution analysis.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
 
-# Asegurar que el directorio raíz está en el PATH
+# Ensure the repository root is on the import path
 sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
 
 from backtesting.engine import BacktestEngine
@@ -44,7 +44,7 @@ console = Console()
 
 
 def create_synthetic_db() -> str:
-    """Crea una base de datos DuckDB temporal con datos sintéticos para demostración."""
+    """Create a temporary DuckDB database with synthetic demo data."""
     fd, path = tempfile.mkstemp(suffix="_demo.duckdb")
     os.close(fd)
     if os.path.exists(path):
@@ -52,7 +52,7 @@ def create_synthetic_db() -> str:
 
     writer = MarketDataWriter(path)
 
-    # 1. Crear mercados
+    # 1. Create markets
     mid = MarketId(Venue.KALSHI, "DEMO-MM-BT")
     market = Market(
         market_id=mid,
@@ -71,7 +71,7 @@ def create_synthetic_db() -> str:
     # Simular 30 ticks y features
     for i in range(30):
         t = base_time + timedelta(minutes=20 * i)
-        # Precio medio oscilando entre 0.45 y 0.55
+        # Mid price oscillating between 0.45 and 0.55
         mid_p = 0.50 + 0.03 * np.sin(i / 3.0)
         spread = 0.02
         ticks.append(
@@ -86,7 +86,7 @@ def create_synthetic_db() -> str:
             )
         )
 
-        # Añadir trade ocasional
+        # Add an occasional trade
         if i % 6 == 0:
             ticks.append(
                 Tick(
@@ -124,7 +124,7 @@ def create_synthetic_db() -> str:
 def run_simple_backtest(db_path: str, market_id: str, strategy: str) -> None:
     console.print(Panel.fit(f"[bold cyan]Simple Backtest Run ({strategy.upper()})[/bold cyan]"))
 
-    # Parámetros base
+    # Base parameters
     strategy_params = {"gamma_I": 0.05, "kappa_x": 1.0}
     if strategy == "cartea_jaimungal":
         strategy_params.update({"phi": 1.5, "eta": 0.04, "rho": -0.2})
@@ -143,7 +143,7 @@ def run_simple_backtest(db_path: str, market_id: str, strategy: str) -> None:
         console.print("[red]No traces generated. Is there tick data in the range?[/red]")
         return
 
-    # Mostrar métricas clave en consola
+    # Print the key metrics to the console
     console.print("\n[bold green]Backtest Completed Successfully![/bold green]")
     console.print(f"  Total Trades: [bold]{metrics['trade_count']}[/bold]")
     console.print(
@@ -171,7 +171,7 @@ def run_parameter_sweep(db_path: str, market_id: str, strategy: str) -> None:
     if strategy == "cartea_jaimungal":
         base_params.update({"phi": 1.5, "eta": 0.04, "rho": -0.2})
 
-    # Sweep de aversión al riesgo gamma_I
+    # Sweep over the risk-aversion parameter gamma_I
     sweep_values = [0.01, 0.05, 0.15, 0.30]
 
     scenario.run_parameter_sweep(
@@ -205,7 +205,7 @@ def run_resolution_spike(
 
 
 def select_local_market(db_path: str) -> tuple[str, datetime]:
-    """Carga los mercados de DuckDB y solicita selección al usuario."""
+    """Load markets from DuckDB and prompt the user to pick one."""
     with MarketDataReader(db_path) as reader:
         markets_df = reader.markets()
         if markets_df.empty:
@@ -215,7 +215,7 @@ def select_local_market(db_path: str) -> tuple[str, datetime]:
         console.print("\n[bold cyan]Available Markets in DuckDB:[/bold cyan]")
         records = markets_df.to_dict("records")
 
-        # Contar ticks y features por mercado, ordenar por más datos primero
+        # Count ticks and features per market, richest first
         for r in records:
             mid = r["market_id"]
             r["_ticks"] = reader.count_ticks(mid)
@@ -254,12 +254,12 @@ def main() -> None:
     console.print(
         Panel(
             "[bold green]Prediction Market Backtester CLI[/bold green]\n"
-            "Ejecute simulaciones de market-making histórico en mercados de Kalshi y Polymarket.",
+            "Run historical market-making simulations on Kalshi and Polymarket markets.",
             subtitle="Framework de Backtesting",
         )
     )
 
-    # 1. Seleccionar base de datos
+    # 1. Select the database
     db_options = ["1", "2"]
     console.print("[bold]Database Source Options:[/bold]")
     console.print("  [1] Synthetic Data (Works immediately out-of-the-box)")
@@ -270,7 +270,7 @@ def main() -> None:
     if db_choice == "1":
         db_path = create_synthetic_db()
         market_id = "kalshi:DEMO-MM-BT"
-        # La resolución del demo está a +10 horas de base_time
+        # The demo market resolves 10 hours after base_time
         resolution_time = datetime.now(UTC) - timedelta(hours=12) + timedelta(hours=10)
         is_synthetic = True
     else:
@@ -291,7 +291,7 @@ def main() -> None:
         default="glft",
     )
 
-    # 3. Seleccionar modo de ejecución
+    # 3. Select the execution mode
     console.print("\n[bold]Execution Mode Options:[/bold]")
     console.print("  [1] Run Simple Backtest (Single performance report)")
     console.print("  [2] Run Parameter Sweep (Sweeps risk aversion gamma_I and prints comparison)")

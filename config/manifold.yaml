@@ -1,25 +1,25 @@
 # config/manifold.yaml
 # ─────────────────────
-# Parámetros para Manifold (sandbox con play-money).
+# Parameters for Manifold (a play-money sandbox).
 #
-# Parámetros más agresivos que producción:
+# More aggressive than production:
 #   Manifold es el entorno de desarrollo — queremos actividad frecuente
-#   para validar el pipeline, no parámetros conservadores.
+#   the goal here is to validate the pipeline, not to be conservative.
 #   Sin riesgo financiero real.
 
 name: manifold
 
-active_categories: []   # monitorizar todos — es sandbox
+active_categories: []   # monitor everything — this is a sandbox
 
 max_markets: 20
 http_timeout: 10
 
 risk:
-  # γ bajo → spreads estrechos → más fills → más datos para calibrar
+  # Low γ → tight spreads → more fills → more data to calibrate with
   gamma: 0.05
-  # q_max alto → más situaciones de near-resolution para testear
+  # High q_max → more near-resolution situations to exercise
   q_max: 20
-  # Sin límites reales — play-money
+  # No real limits — play money
   max_daily_loss: 999999.0
   max_position_loss: 999999.0
 

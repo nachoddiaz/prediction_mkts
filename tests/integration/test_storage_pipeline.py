@@ -1,20 +1,20 @@
 """
 tests/integration/test_storage_pipeline.py
 ────────────────────────────────────────────
-Tests del writer y del pipeline de storage.
+Tests for the writer and the storage pipeline.
 
-Por qué DuckDB :memory: en lugar de un archivo temporal:
-  :memory: es más rápido (sin I/O de disco), se destruye automáticamente
-  al cerrar la conexión (sin cleanup necesario), y evita colisiones
-  entre tests paralelos. El comportamiento es idéntico al modo archivo
-  para todos los propósitos de testing.
+Why DuckDB :memory: rather than a temporary file:
+  :memory: is faster (no disk I/O), is destroyed automatically when the
+  connection closes (no cleanup needed), and avoids collisions between
+  parallel tests. Behaviour is identical to file mode for every testing
+  purpose.
 
-Por qué separar TestSyncAPI de TestAsyncAPI:
-  La API síncrona testea la lógica de persistencia pura — si el SQL
-  es correcto, si las columnas generadas funcionan, si el upsert
-  actualiza los campos correctos. La API asíncrona testea el comportamiento
-  del buffer — flush por tamaño, flush por tiempo, graceful shutdown.
-  Son responsabilidades distintas que merecen tests distintos.
+Why TestSyncAPI is separate from TestAsyncAPI:
+  The synchronous API tests pure persistence logic — whether the SQL is
+  correct, whether the generated columns work, whether the upsert updates the
+  right fields. The asynchronous API tests buffer semantics — flush by size,
+  flush by time, graceful shutdown. Distinct responsibilities deserve distinct
+  tests.
 """
 
 from __future__ import annotations
@@ -47,7 +47,7 @@ from normalizer.schema import (
 from storage.writer import MarketDataWriter
 
 # ---------------------------------------------------------------------------
-# Helpers — constructores de objetos del dominio para tests
+# Helpers — domain object constructors for tests
 # ---------------------------------------------------------------------------
 
 
@@ -108,18 +108,18 @@ def make_orderbook(mid: MarketId | None = None) -> OrderBook:
 
 
 def mem() -> MarketDataWriter:
-    """Writer con DuckDB en memoria — el más rápido para tests."""
+    """Writer backed by in-memory DuckDB — the fastest option for tests."""
     return MarketDataWriter(db_path=":memory:")
 
 
 # ---------------------------------------------------------------------------
-# Tests API síncrona
+# Synchronous API tests
 # ---------------------------------------------------------------------------
 
 
 class TestSyncAPI:
     def test_write_market(self) -> None:
-        """Verifica que los campos básicos de un market se persisten."""
+        """A market's basic fields are persisted."""
         with mem() as w:
             w.write_market_sync(make_market())
             row = w._con.execute("SELECT market_id, status, category FROM markets").fetchone()
@@ -127,10 +127,10 @@ class TestSyncAPI:
             assert row[1] == "open"
             assert row[2] == "crypto"
 
-    def test_upsert_no_duplica(self) -> None:
+    def test_upsert_does_not_duplicate(self) -> None:
         """
-        Escribir el mismo market_id dos veces debe producir una sola fila.
-        Verifica que ON CONFLICT DO UPDATE funciona correctamente.
+        Writing the same market_id twice must produce a single row.
+        Verifies that ON CONFLICT DO UPDATE works.
         """
         with mem() as w:
             w.write_market_sync(make_market())
@@ -138,10 +138,10 @@ class TestSyncAPI:
             count = w._con.execute("SELECT COUNT(*) FROM markets").fetchone()[0]
             assert count == 1
 
-    def test_upsert_actualiza_status(self) -> None:
+    def test_upsert_updates_status(self) -> None:
         """
-        Al resolver un mercado, el upsert debe actualizar status y
-        resolved_value sin duplicar la fila ni modificar otros campos.
+        On resolution the upsert must update status and resolved_value without
+        duplicating the row or modifying any other field.
         """
         with mem() as w:
             w.write_market_sync(make_market())
@@ -163,8 +163,8 @@ class TestSyncAPI:
 
     def test_write_ticks_batch(self) -> None:
         """
-        Batch de N ticks debe persistir exactamente N filas.
-        Verifica que executemany funciona correctamente con múltiples items.
+        A batch of N ticks must persist exactly N rows.
+        Verifies executemany works with multiple items.
         """
         with mem() as w:
             ticks = [make_tick() for _ in range(5)]
@@ -174,9 +174,8 @@ class TestSyncAPI:
 
     def test_tick_quote_side_null(self) -> None:
         """
-        Los ticks QUOTE no tienen side — debe persistirse como NULL.
-        side=NULL es una regla de negocio del schema: sin agresión,
-        no hay dirección.
+        QUOTE ticks have no side — it must persist as NULL. side=NULL is a
+        schema business rule: without an aggressor there is no direction.
         """
         with mem() as w:
             w.write_ticks_sync([make_tick(tick_type=TickType.QUOTE)])
@@ -186,8 +185,8 @@ class TestSyncAPI:
 
     def test_tick_trade_side_set(self) -> None:
         """
-        Los ticks TRADE deben tener side — fundamental para calcular
-        adverse selection y OBI en features/microstructure.py.
+        TRADE ticks must carry a side — essential for computing adverse
+        selection and OBI in features/microstructure.py.
         """
         with mem() as w:
             w.write_ticks_sync([make_tick(tick_type=TickType.TRADE, side=Side.YES)])
@@ -196,11 +195,11 @@ class TestSyncAPI:
             assert row[1] == pytest.approx(10.0)
             assert row[2] == "yes"
 
-    def test_columnas_generadas_mid_spread(self) -> None:
+    def test_generated_columns_mid_and_spread(self) -> None:
         """
-        mid y spread son GENERATED ALWAYS AS — DuckDB las calcula
-        automáticamente. Verificamos que el cálculo es correcto y que
-        no necesitamos insertarlas manualmente.
+        mid and spread are GENERATED ALWAYS AS — DuckDB computes them
+        automatically. We verify the computation is correct and that we do not
+        need to insert them by hand.
         """
         with mem() as w:
             w.write_ticks_sync([make_tick(bid=0.44, ask=0.46)])
@@ -210,7 +209,7 @@ class TestSyncAPI:
 
     def test_write_orderbook(self) -> None:
         """
-        Verifica que best_bid, best_ask y las profundidades pre-computadas
+        Verifies best_bid, best_ask and the precomputed depths.
         se persisten correctamente.
         """
         with mem() as w:
@@ -225,8 +224,8 @@ class TestSyncAPI:
 
     def test_orderbook_json_parseable(self) -> None:
         """
-        bids_json y asks_json deben ser JSON válido y reconstruible.
-        El backtesting engine los parseará para reconstruir el libro.
+        bids_json and asks_json must be valid, reconstructible JSON.
+        The backtesting engine parses them to reconstruct the book.
         """
         with mem() as w:
             w.write_orderbook_sync(make_orderbook())
@@ -234,13 +233,13 @@ class TestSyncAPI:
             bids = _json.loads(row[0])
             asks = _json.loads(row[1])
             assert len(bids) == 2
-            assert bids[0][0] == pytest.approx(0.45)  # mejor bid primero
-            assert asks[0][0] == pytest.approx(0.47)  # mejor ask primero
+            assert bids[0][0] == pytest.approx(0.45)  # best bid first
+            assert asks[0][0] == pytest.approx(0.47)  # best ask first
 
     def test_write_snapshot(self) -> None:
         """
-        Un snapshot debe persistir los tres componentes en una llamada.
-        Verifica que write_snapshot_sync orquesta correctamente.
+        A snapshot must persist all three components in one call.
+        Verifies write_snapshot_sync orchestrates correctly.
         """
         with mem() as w:
             mid = make_market_id()
@@ -256,9 +255,9 @@ class TestSyncAPI:
 
     def test_write_features(self) -> None:
         """
-        Verifica que features se persisten correctamente.
-        La conversión de dict a tuple (por limitación de DuckDB con
-        named params en executemany) debe ser transparente al caller.
+        Verifies features are persisted correctly.
+        The dict-to-tuple conversion (a DuckDB limitation with named params in
+        executemany) must be transparent to the caller.
         """
         with mem() as w:
             rows = [
@@ -281,18 +280,18 @@ class TestSyncAPI:
 
     def test_empty_writes_no_error(self) -> None:
         """
-        Pasar una lista vacía no debe lanzar excepción ni ejecutar SQL.
+        Passing an empty list must not raise or execute SQL.
         El guard if not ticks/rows evita ejecutar executemany([])
-        que en algunas versiones de DuckDB puede dar error.
+        which some DuckDB versions reject.
         """
         with mem() as w:
             assert w.write_ticks_sync([]) == 0
             assert w.write_features_sync([]) == 0
 
-    def test_multiples_venues(self) -> None:
+    def test_multiple_venues(self) -> None:
         """
-        Ticks de Kalshi y Polymarket coexisten en la misma tabla.
-        El campo venue permite filtrarlos independientemente.
+        Kalshi and Polymarket ticks coexist in the same table.
+        The venue field allows them to be filtered independently.
         """
         with mem() as w:
             k_id = make_market_id(Venue.KALSHI, "KXBTC-TEST")
@@ -305,7 +304,7 @@ class TestSyncAPI:
 
 
 # ---------------------------------------------------------------------------
-# Tests API asíncrona
+# Asynchronous API tests
 # ---------------------------------------------------------------------------
 
 
@@ -313,31 +312,31 @@ class TestAsyncAPI:
     @pytest.mark.asyncio
     async def test_enqueue_tick(self) -> None:
         """
-        Un tick encolado debe persistirse tras un flush explícito.
-        Usamos _flush_now() directamente en lugar de esperar el timer
-        para que el test sea determinista y rápido.
+        An enqueued tick must persist after an explicit flush.
+        We call flush_now() directly rather than waiting for the timer
+        so the test is deterministic and fast.
         """
         async with MarketDataWriter(db_path=":memory:", flush_interval_seconds=1) as w:
             await w.enqueue(make_tick())
-            await w._flush_now()
+            await w.flush_now()
             count = w._con.execute("SELECT COUNT(*) FROM ticks").fetchone()[0]
             assert count == 1
 
     @pytest.mark.asyncio
     async def test_enqueue_market(self) -> None:
-        """Un market encolado debe persistirse tras flush."""
+        """An enqueued market must persist after a flush."""
         async with MarketDataWriter(db_path=":memory:", flush_interval_seconds=1) as w:
             await w.enqueue(make_market())
-            await w._flush_now()
+            await w.flush_now()
             count = w._con.execute("SELECT COUNT(*) FROM markets").fetchone()[0]
             assert count == 1
 
     @pytest.mark.asyncio
-    async def test_flush_por_tamano(self) -> None:
+    async def test_flush_on_size(self) -> None:
         """
-        Con flush_max_items=5, al llegar al límite enqueue() debe
-        forzar un flush automático antes de encolar el item 6.
-        El timer está en 60s para que no interfiera.
+        With flush_max_items=5, on reaching the limit enqueue() must force an
+        automatic flush before enqueuing item 6.
+        The timer is set to 60 s so it does not interfere.
         """
         async with MarketDataWriter(
             db_path=":memory:",
@@ -346,15 +345,15 @@ class TestAsyncAPI:
         ) as w:
             for _ in range(6):
                 await w.enqueue(make_tick())
-            await w._flush_now()  # flush del residuo
+            await w.flush_now()  # flush the remainder
             count = w._con.execute("SELECT COUNT(*) FROM ticks").fetchone()[0]
             assert count == 6
 
     @pytest.mark.asyncio
     async def test_enqueue_snapshot(self) -> None:
         """
-        enqueue_snapshot debe encolar los tres componentes del snapshot.
-        Tras flush, deben existir una fila en cada tabla.
+        enqueue_snapshot must enqueue all three snapshot components.
+        After the flush there must be one row in each table.
         """
         async with MarketDataWriter(db_path=":memory:") as w:
             mid = make_market_id()
@@ -364,7 +363,7 @@ class TestAsyncAPI:
                 last_tick=make_tick(mid),
             )
             await w.enqueue_snapshot(snapshot)
-            await w._flush_now()
+            await w.flush_now()
             assert w._con.execute("SELECT COUNT(*) FROM markets").fetchone()[0] == 1
             assert w._con.execute("SELECT COUNT(*) FROM orderbooks").fetchone()[0] == 1
             assert w._con.execute("SELECT COUNT(*) FROM ticks").fetchone()[0] == 1
@@ -372,14 +371,14 @@ class TestAsyncAPI:
     @pytest.mark.asyncio
     async def test_stop_flush_final(self) -> None:
         """
-        Al parar el writer, los items pendientes deben persistirse.
-        Verificamos ANTES de stop() porque stop() cierra la conexión.
+        On stopping the writer, any pending items must be persisted.
+        Checked BEFORE stop(), because stop() closes the connection.
         """
         w = MarketDataWriter(db_path=":memory:", flush_interval_seconds=1)
         await w.start()
         for _ in range(3):
             await w.enqueue(make_tick())
-        await w._flush_now()  # flush explícito antes de stop
+        await w.flush_now()  # explicit flush before stop
         count = w._con.execute("SELECT COUNT(*) FROM ticks").fetchone()[0]
         assert count == 3
         await w.stop()
@@ -388,15 +387,15 @@ class TestAsyncAPI:
     @pytest.mark.asyncio
     async def test_stats(self) -> None:
         """
-        Los stats deben reflejar correctamente lo escrito.
-        Útil para monitorización — si stats["ticks"] no crece,
-        el pipeline de ingesta está roto.
+        The stats must correctly reflect what was written.
+        Useful for monitoring — if stats["ticks"] stops growing, the
+        ingestion pipeline is broken.
         """
         async with MarketDataWriter(db_path=":memory:") as w:
             await w.enqueue(make_tick())
             await w.enqueue(make_tick())
             await w.enqueue(make_market())
-            await w._flush_now()
+            await w.flush_now()
             assert w.stats["ticks"] == 2
             assert w.stats["markets"] == 1
             assert w.stats["flushes"] >= 1

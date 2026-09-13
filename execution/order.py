@@ -1,7 +1,7 @@
 """
 execution/order.py
 ───────────────────
-Esquemas y tipos para órdenes de la capa de ejecución.
+Schemas and types for execution-layer orders.
 """
 
 from __future__ import annotations
@@ -14,14 +14,14 @@ from normalizer.schema import MarketId, Price, Side, Size
 
 
 class OrderAction(str, Enum):
-    """Acción de la orden: COMPRAR o VENDER."""
+    """The order's action: BUY or SELL."""
 
     BUY = "buy"
     SELL = "sell"
 
 
 class OrderType(str, Enum):
-    """Tipo de orden: LIMIT (orden limitada) o MARKET (orden a mercado)."""
+    """Order type: LIMIT or MARKET."""
 
     LIMIT = "limit"
     MARKET = "market"
@@ -29,13 +29,13 @@ class OrderType(str, Enum):
 
 class OrderStatus(str, Enum):
     """
-    Estado de ciclo de vida de la orden.
+    The order's lifecycle state.
 
-    PENDING   → Enviada al motor pero no confirmada por la venue.
-    ACTIVE    → Confirmada y reposando en el libro de órdenes.
-    FILLED    → Completada al 100%.
-    CANCELLED → Cancelada por el usuario antes de completarse.
-    REJECTED  → Rechazada por el motor o por la venue (ej. por límites de riesgo).
+    PENDING   → Sent to the engine but not yet confirmed by the venue.
+    ACTIVE    → Confirmed and resting in the order book.
+    FILLED    → Fully executed.
+    CANCELLED → Cancelled by us before completion.
+    REJECTED  → Rejected by the engine or the venue (e.g. on risk limits).
     """
 
     PENDING = "pending"
@@ -48,12 +48,12 @@ class OrderStatus(str, Enum):
 @dataclass
 class Order:
     """
-    Representa una orden colocada en el sistema.
+    An order placed in the system.
 
-    Por qué mutable en filled_size, status y updated_at:
-      A diferencia de las primitivas de datos de mercado (ticks, orderbooks)
-      que representan eventos inmutables en el tiempo, una orden representa
-      una entidad de negocio con estado mutable (ciclo de vida).
+    Why filled_size, status and updated_at are mutable:
+      Unlike market-data primitives (ticks, order books), which represent
+      immutable events in time, an order is a business entity with mutable
+      state — it has a lifecycle.
     """
 
     order_id: str
@@ -78,10 +78,10 @@ class Order:
 
     @property
     def remaining_size(self) -> Size:
-        """Cantidad restante de la orden por ejecutar."""
+        """Quantity of the order still to be executed."""
         return Size(self.size - self.filled_size)
 
     @property
     def is_active(self) -> bool:
-        """Devuelve True si la orden aún puede ser completada o cancelada."""
+        """True while the order can still be filled or cancelled."""
         return self.status in (OrderStatus.PENDING, OrderStatus.ACTIVE)

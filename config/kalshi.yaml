@@ -1,17 +1,17 @@
 # config/kalshi.yaml
 # ───────────────────
-# Parámetros del modelo y riesgo para Kalshi.
+# Model and risk parameters for Kalshi.
 #
-# IMPORTANTE: los valores de model/ son INICIALES — no calibrados.
-# Ejecuta research/02_calibration.ipynb después de acumular
-# al menos 1 semana de datos históricos para obtener valores reales.
+# IMPORTANT: the values under model/ are INITIAL — not calibrated.
+# Run research/02_calibration.ipynb after accumulating at least one week of
+# historical data to obtain real values.
 #
-# update_model_params() del notebook escribe en este archivo
-# y añade last_calibrated automáticamente.
+# update_model_params() in the notebook writes to this file and adds
+# last_calibrated automatically.
 
 name: kalshi
 
-# Categorías a monitorizar. Lista vacía = todas.
+# Categories to monitor. An empty list means all of them.
 active_categories:
   - crypto
   - politics
@@ -21,65 +21,65 @@ max_markets: 50
 http_timeout: 10
 
 # ---------------------------------------------------------------------------
-# Parámetros de riesgo
-# Ajustar manualmente según tu capital y apetito de riesgo.
-# Empezar conservador — puedes subir gradualmente.
+# Risk parameters
+# Tune these by hand according to your capital and risk appetite.
+# Start conservative — you can raise them gradually.
 # ---------------------------------------------------------------------------
 risk:
-  # γ_I — CARA inventory risk aversion (1/$). Mayor γ_I = spreads más anchos.
-  # Separado de φ_K (Kelly multiplier) según §8 MATH.md v2.1
-  # Rango típico en prediction markets: 0.05 - 0.5
+  # γ_I — CARA inventory risk aversion (1/$). Higher γ_I = wider spreads.
+  # Kept separate from φ_K (the Kelly multiplier) per §8 MATH.md v2.1
+  # Typical range in prediction markets: 0.05 - 0.5
   gamma_I: 0.1
 
-  # Inventario máximo antes de near-resolution rules (§6.4 MATH.md)
+  # Maximum inventory before the near-resolution rules apply (§6.4 MATH.md)
   q_max: 10
 
-  # Halt automático si el P&L del día cae por debajo de esto (USD)
+  # Automatic halt if the day's P&L falls below this (USD)
   max_daily_loss: 100.0
 
-  # Pérdida máxima por posición individual (USD)
+  # Maximum loss on a single position (USD)
   max_position_loss: 20.0
 
-  # Coste de capital anualizado ρ_c — §8.1 MATH.md v2.1
+  # Annualised cost of capital ρ_c — §8.1 MATH.md v2.1
   capital_cost_rho: 0.07
 
-  # Tick size mínimo del spread en precio — §4.1 MATH.md v2.1
+  # Minimum spread tick size, in price space — §4.1 MATH.md v2.1
   tick_size: 0.01
 
 # ---------------------------------------------------------------------------
-# Parámetros del modelo
-# VALORES INICIALES — calibrar con research/02_calibration.ipynb
-# last_calibrated se añade automáticamente al calibrar
+# Model parameters
+# INITIAL VALUES — calibrate with research/02_calibration.ipynb
+# last_calibrated is added automatically on calibration
 # ---------------------------------------------------------------------------
 model:
-  # GLFT §3 — calibrar por MLE sobre fill rates históricos
-  kappa_p: 1.5   # decay del arrival rate (espacio precio, 1/$)
-  kappa_x: null  # decay en espacio logit (se calcula desde kappa_p al calibrar)
+  # GLFT §3 — calibrate by MLE over historical fill rates
+  kappa_p: 1.5   # arrival-rate decay (price space, 1/$)
+  kappa_x: null  # decay in logit space (derived from kappa_p on calibration)
   A: 0.1         # baseline arrival rate
 
-  # Cartea-Jaimungal §4 — calibrar por AR(1) sobre serie μ̂_t
-  phi: 1.0       # mean-reversion speed del drift latente
-  eta: 0.05      # volatilidad del drift latente
-  rho: 0.1       # correlación Δp_t ↔ Δμ̂_t
+  # Cartea-Jaimungal §4 — calibrate by AR(1) over the μ̂_t series
+  phi: 1.0       # mean-reversion speed of the latent drift
+  eta: 0.05      # volatility of the latent drift
+  rho: 0.1       # correlation Δp_t ↔ Δμ̂_t
 
-  # ρ_μ — descuento por riesgo de cambio de medida (§5 MATH.md v2.1)
-  # Mide confianza en que el edge no ha sido arbitrado
-  # Típico: 0.3-0.6 en Polymarket politics, 0.6-0.8 en Kalshi sports
+  # ρ_μ — discount for measure-change risk (§5 MATH.md v2.1)
+  # Measures confidence that the edge has not already been arbitraged away
+  # Typical: 0.3-0.6 on Polymarket politics, 0.6-0.8 on Kalshi sports
   rho_mu: 0.5
 
   # φ_K — Kelly fractional multiplier (§8 MATH.md v2.1)
-  # Separado de γ_I (inventory aversion). Default 0.25-0.5
+  # Kept separate from γ_I (inventory aversion). Default 0.25-0.5
   phi_kelly: 0.25
 
-  # r — probabilidad de reversal del oracle UMA/DCM (§8.1 MATH.md v2.1)
+  # r — UMA/DCM oracle reversal probability (§8.1 MATH.md v2.1)
   oracle_reversal_r: 0.001
 
-  # τ* — escala temporal para q_max exponencial (§8.3 MATH.md v2.1)
-  # En horas — típico 24.0
+  # τ* — time scale for the exponential q_max (§8.3 MATH.md v2.1)
+  # In hours — typically 24.0
   tau_star_hours: 24.0
 
-  # Pesos señal §4.6 — calibrar por Ridge regression
-  # w_news y w_onchain son 0 hasta implementar esas señales
+  # Signal weights §4.6 — calibrate by ridge regression
+  # w_news and w_onchain stay 0 until those signals are implemented
   w_obi: 1.0
   w_news: 0.0
   w_onchain: 0.0

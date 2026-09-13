@@ -1,18 +1,18 @@
 """
 tests/integration/test_venues_live.py
 ───────────────────────────────────────
-Tests de integración contra las APIs reales de Kalshi, Polymarket
-y Manifold. Hacen peticiones HTTP reales — requieren conexión a internet.
+Integration tests against the real Kalshi, Polymarket and Manifold APIs. They
+make real HTTP requests and require an internet connection.
 
-NO se ejecutan en CI automático. Solo manualmente para verificar
-que los connectors funcionan contra la API real.
+They do NOT run in CI. Only manually, to verify the connectors work against
+the real APIs.
 
-Ejecutar:
+To run:
     uv run pytest tests/integration/test_venues_live.py -v -s
 
-Por qué -s:
-    Muestra el output de print() en tiempo real — útil para ver
-    los datos que devuelve cada API mientras el test corre.
+Why -s:
+    Shows print() output live — useful for seeing the data each API returns
+    while the test runs.
 """
 
 from __future__ import annotations
@@ -34,7 +34,7 @@ from normalizer.polymarket_adapter import (
 from normalizer.schema import Tick, Venue
 
 # ---------------------------------------------------------------------------
-# Separador visual para terminal
+# Visual separator for the terminal
 # ---------------------------------------------------------------------------
 
 
@@ -67,11 +67,12 @@ def divider() -> None:
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 
 
+@pytest.mark.live
 @pytest.mark.asyncio
 async def test_kalshi_markets_live() -> None:
     """
-    Fetcha mercados reales de Kalshi y muestra raw vs normalizado.
-    Verifica que el adapter procesa correctamente la respuesta real.
+    Fetch real Kalshi markets and show raw versus normalised.
+    Verifies the adapter processes the real response correctly.
     """
     header("KALSHI — MARKETS (live)")
 
@@ -84,7 +85,7 @@ async def test_kalshi_markets_live() -> None:
             data = await resp.json()
 
     markets_raw = data.get("markets", [])
-    assert len(markets_raw) > 0, "API devolvió 0 mercados"
+    assert len(markets_raw) > 0, "the API returned 0 markets"
 
     print(f"\n  Mercados recibidos: {len(markets_raw)}")
 
@@ -98,7 +99,7 @@ async def test_kalshi_markets_live() -> None:
         raw_line("yes_bid_dollars", raw.get("yes_bid_dollars"))
         raw_line("yes_ask_dollars", raw.get("yes_ask_dollars"))
         raw_line("volume_fp", raw.get("volume_fp"))
-        raw_line("series_ticker", raw.get("series_ticker") or "(vacío)")
+        raw_line("series_ticker", raw.get("series_ticker") or "(empty)")
 
         print(f"\n  {'── NORMALIZADO ──':─<50}")
         try:
@@ -110,28 +111,29 @@ async def test_kalshi_markets_live() -> None:
             norm_line(
                 "resolution_date", market.resolution.resolution_date.strftime("%Y-%m-%d %H:%M UTC")
             )
-            norm_line("tau (años)", f"{market.resolution.tau:.4f}")
-            norm_line("tau (días)", f"{market.resolution.tau * 365.25:.1f}")
+            norm_line("tau (years)", f"{market.resolution.tau:.4f}")
+            norm_line("tau (days)", f"{market.resolution.tau * 365.25:.1f}")
             norm_line("is_resolved", market.resolution.is_resolved())
             norm_line("is_tradeable", market.is_tradeable())
-            print("\n  ✓ Normalización correcta")
+            print("\n  ✓ Normalisation correct")
         except Exception as e:
-            print(f"\n  ✗ Error en normalización: {e}")
+            print(f"\n  ✗ Normalisation error: {e}")
             raise
 
         divider()
 
 
+@pytest.mark.live
 @pytest.mark.asyncio
 async def test_kalshi_orderbook_live() -> None:
     """
-    Fetcha el orderbook real de un mercado de Kalshi.
-    Usa el primer mercado con liquidez que encuentre.
+    Fetch a real Kalshi market's order book.
+    Uses the first market with liquidity it finds.
     """
     header("KALSHI — ORDERBOOK (live)")
 
     async with aiohttp.ClientSession() as session:
-        # Primero buscar un ticker con volumen
+        # First find a ticker with volume
         url = f"{KALSHI_BASE}/markets"
         params = {"status": "open", "limit": 10}
         async with session.get(url, params=params) as resp:
@@ -159,8 +161,8 @@ async def test_kalshi_orderbook_live() -> None:
     raw_no = book.get("no", [])
 
     print(f"\n  {'── RAW ──':─<50}")
-    raw_line("yes (top 3 bids)", raw_yes[:3] if raw_yes else "(vacío)")
-    raw_line("no  (top 3 asks)", raw_no[:3] if raw_no else "(vacío)")
+    raw_line("yes (top 3 bids)", raw_yes[:3] if raw_yes else "(empty)")
+    raw_line("no  (top 3 asks)", raw_no[:3] if raw_no else "(empty)")
     raw_line("total yes levels", len(raw_yes))
     raw_line("total no  levels", len(raw_no))
 
@@ -190,7 +192,7 @@ async def test_kalshi_orderbook_live() -> None:
         norm_line("spread", f"{tick.spread:.4f}")
         print("\n  ✓ Tick generado correctamente")
     else:
-        print("\n  ⚠ Libro vacío — sin tick generado")
+        print("\n  ⚠ Empty book — no tick generated")
 
 
 # ---------------------------------------------------------------------------
@@ -201,10 +203,11 @@ GAMMA_BASE = "https://gamma-api.polymarket.com"
 CLOB_BASE = "https://clob.polymarket.com"
 
 
+@pytest.mark.live
 @pytest.mark.asyncio
 async def test_polymarket_markets_live() -> None:
     """
-    Fetcha mercados reales de Polymarket y muestra raw vs normalizado.
+    Fetch real Polymarket markets and show raw versus normalised.
     """
     header("POLYMARKET — MARKETS (live)")
 
@@ -223,7 +226,7 @@ async def test_polymarket_markets_live() -> None:
     for i, raw in enumerate(markets_raw, 1):
         print(f"\n  ▶ Market {i}/{len(markets_raw)}")
 
-        # Inferir tags si vienen vacíos
+        # Infer tags where they arrive empty
         tags = raw.get("tags", [])
         if not tags:
             q = raw.get("question", "").lower()
@@ -253,8 +256,8 @@ async def test_polymarket_markets_live() -> None:
             norm_line(
                 "resolution_date", market.resolution.resolution_date.strftime("%Y-%m-%d %H:%M UTC")
             )
-            norm_line("tau (años)", f"{market.resolution.tau:.4f}")
-            norm_line("tau (días)", f"{market.resolution.tau * 365.25:.1f}")
+            norm_line("tau (years)", f"{market.resolution.tau:.4f}")
+            norm_line("tau (days)", f"{market.resolution.tau * 365.25:.1f}")
             norm_line("is_tradeable", market.is_tradeable())
 
             token_ids = _parse_clob_token_ids(raw)
@@ -263,23 +266,24 @@ async def test_polymarket_markets_live() -> None:
                 norm_line("yes_token_id", yes_id[:40] + "...")
                 norm_line("no_token_id", no_id[:40] + "...")
 
-            print("\n  ✓ Normalización correcta")
+            print("\n  ✓ Normalisation correct")
         except Exception as e:
-            print(f"\n  ✗ Error en normalización: {e}")
+            print(f"\n  ✗ Normalisation error: {e}")
             raise
 
         divider()
 
 
+@pytest.mark.live
 @pytest.mark.asyncio
 async def test_polymarket_orderbook_live() -> None:
     """
-    Fetcha el orderbook real de Polymarket usando endpoints públicos.
+    Fetch a real Polymarket order book using the public endpoints.
     """
     header("POLYMARKET — ORDERBOOK (live)")
 
     async with aiohttp.ClientSession() as session:
-        # Obtener primer mercado con token ID
+        # Take the first market carrying a token ID
         url = f"{GAMMA_BASE}/markets"
         params = {"limit": 5, "active": "true", "order": "volume24hr", "ascending": "false"}
         async with session.get(url, params=params) as resp:
@@ -302,7 +306,7 @@ async def test_polymarket_orderbook_live() -> None:
         print(f"\n  Token YES: {yes_token[:24]}...")
         print(f"  Mercado:   {market_used.get('question', '')[:50]}")
 
-        # Fetchear mid y prices en paralelo
+        # Fetch mid and prices in parallel
         async with session.get(f"{CLOB_BASE}/midpoint?token_id={yes_token}") as r:
             mid_data = await r.json() if r.status == 200 else None
         async with session.get(f"{CLOB_BASE}/price?token_id={yes_token}&side=BUY") as r:
@@ -320,7 +324,7 @@ async def test_polymarket_orderbook_live() -> None:
         best_bid = float(sell_data["price"])
         mid = float(mid_data["mid"])
 
-        # Corregir si están invertidos o salen de los límites [0, 1]
+        # Fix them if inverted or outside the [0, 1] bounds
         if best_bid >= best_ask:
             best_bid = max(0.0001, mid - 0.001)
             best_ask = min(0.9999, mid + 0.001)
@@ -351,11 +355,12 @@ async def test_polymarket_orderbook_live() -> None:
 MANIFOLD_BASE = "https://manifold.markets/api/v0"
 
 
+@pytest.mark.live
 @pytest.mark.asyncio
 async def test_manifold_markets_live() -> None:
     """
-    Fetcha mercados reales de Manifold y muestra raw vs normalizado.
-    Manifold es el más simple — sin auth, sin CLOB, solo probability.
+    Fetch real Manifold markets and show raw versus normalised.
+    Manifold is the simplest — no auth, no CLOB, just a probability.
     """
     header("MANIFOLD — MARKETS (live)")
 
@@ -394,7 +399,7 @@ async def test_manifold_markets_live() -> None:
             market = connector._raw_to_market(raw)
 
             if market is None:
-                print("  ⚠ Market ignorado (sin closeTime o slug)")
+                print("  ⚠ Market skipped (no closeTime or slug)")
                 divider()
                 continue
 
@@ -405,11 +410,11 @@ async def test_manifold_markets_live() -> None:
             norm_line(
                 "resolution_date", market.resolution.resolution_date.strftime("%Y-%m-%d %H:%M UTC")
             )
-            norm_line("tau (años)", f"{market.resolution.tau:.4f}")
-            norm_line("tau (días)", f"{market.resolution.tau * 365.25:.1f}")
+            norm_line("tau (years)", f"{market.resolution.tau:.4f}")
+            norm_line("tau (days)", f"{market.resolution.tau * 365.25:.1f}")
             norm_line("is_tradeable", market.is_tradeable())
 
-            # Orderbook sintético
+            # Synthetic order book
             prob = float(raw.get("probability", 0.5))
             ob = ManifoldConnector._synthetic_orderbook(market.market_id, prob)
             norm_line("synthetic_bid", f"{ob.best_bid:.4f}")
@@ -417,7 +422,7 @@ async def test_manifold_markets_live() -> None:
             norm_line("synthetic_mid", f"{ob.mid:.4f}")
             norm_line("synthetic_spread", f"{ob.spread:.4f}")
 
-            print("\n  ✓ Normalización correcta")
+            print("\n  ✓ Normalisation correct")
         except Exception as e:
             print(f"\n  ✗ Error: {e}")
             raise
@@ -425,16 +430,17 @@ async def test_manifold_markets_live() -> None:
         divider()
 
 
+@pytest.mark.live
 @pytest.mark.asyncio
 async def test_manifold_bets_live() -> None:
     """
-    Fetcha los trades recientes de Manifold.
-    Equivalente a los TRADE ticks de Kalshi/Polymarket.
+    Fetch Manifold's recent trades.
+    Equivalent to Kalshi's and Polymarket's TRADE ticks.
     """
     header("MANIFOLD — BETS/TRADES (live)")
 
     async with aiohttp.ClientSession() as session:
-        # Primero obtener un market con actividad
+        # First obtain a market with activity
         url = f"{MANIFOLD_BASE}/markets"
         # Manifold API changed - filter manually for open BINARY markets
         params = {"limit": 10}
@@ -467,8 +473,8 @@ async def test_manifold_bets_live() -> None:
         raw_line("id", bet.get("id"))
         raw_line("amount", bet.get("amount"))
         raw_line("outcome", bet.get("outcome"))  # YES | NO
-        raw_line("probAfter", bet.get("probAfter"))  # precio después del trade
-        raw_line("probBefore", bet.get("probBefore"))  # precio antes del trade
+        raw_line("probAfter", bet.get("probAfter"))  # price after the trade
+        raw_line("probBefore", bet.get("probBefore"))  # price before the trade
         raw_line("createdTime", bet.get("createdTime"))
 
         # Construir Tick equivalente

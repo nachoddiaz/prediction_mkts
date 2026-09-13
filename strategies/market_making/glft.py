@@ -1,69 +1,125 @@
 """
 strategies/market_making/glft.py
 ─────────────────────────────────
-Modelo GLFT en espacio logit — aproximación AS (§4.1 MATH.md v2.1).
+GLFT quoter in logit space — Avellaneda-Stoikov approximation (MATH.md §5.4).
 
-Opera enteramente en X = logit(p) ∈ ℝ donde los modelos clásicos
-(AS, GLFT, CJ) aplican con sus pruebas intactas.
+Operates entirely on X = logit(p) ∈ ℝ, where the classical models (AS, GLFT,
+Cartea-Jaimungal) apply with their proofs intact.
 
-Los quotes se calculan en X y se mapean a precio via σ(X) = 1/(1+e^{-X})
-al final — así el spread se comprime automáticamente cerca de los bordes
-sin ningún hack adicional.
+Quotes are computed in X and mapped back to price via σ(X) = 1/(1+e^{-X}) at
+the very end, so the quoted spread compresses near the boundaries automatically
+— no clamping hack required.
 
-Por qué aproximación AS y no GLFT exacto (ODE):
-  El GLFT exacto requiere integrar numéricamente 2Q+1 ODEs acopladas
-  (una por nivel de inventario) hacia atrás desde T. Para Q=10 son 21
-  ecuaciones que tardan ~ms por quote. La aproximación AS en logit es
-  suficiente para Fase 1 — cuando tengamos datos reales para validar
-  la diferencia con el ODE exacto, lo añadiremos como glft_exact().
+Why the AS approximation and not the exact GLFT ODE system:
+  Exact GLFT requires integrating 2Q+1 coupled ODEs backwards from T, one per
+  inventory level. For Q=10 that is 21 equations and milliseconds per quote.
+  The AS approximation in logit space is adequate until we have enough real
+  data to measure the difference; the exact solver would land as glft_exact().
 
-Relación con MATH.md v2.1:
-  §4.1 → reservation log-odds y spread óptimo
-  §4.2 → estructura del GLFT exacto (no implementado aquí)
-  §4.3 → calibración κ_p vs κ_x y conversión
-  (2.3) → tick floor
+Mapping to MATH.md v2.2:
+  §5.4 (2.1) → reservation log-odds
+  §5.4 (2.2) → optimal half-spread, exact rent term
+  §5.4 (2.3) → tick floor
+  §6.4       → near-resolution regime multiplier on γ
 """
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
-from features.resolution import TAU_1H, NearResolutionRegime
+from features.resolution import (
+    TAU_1H,
+    NearResolutionRegime,
+    effective_gamma_for_regime,
+)
+from normalizer.price_grid import PriceLadder, ladder_for_venue
 from normalizer.schema import MarketId
 
+log = logging.getLogger(__name__)
+
 # ---------------------------------------------------------------------------
-# Constantes
+# Constants
 # ---------------------------------------------------------------------------
 
-# Tick mínimo cotizable en Kalshi y Polymarket
+# Fallback tick. This is NOT the real tick of either target venue: Kalshi steps
+# 0.001 in its main band and Polymarket is uniformly 0.001. It survives only as
+# the default for markets without ladder metadata (Manifold, test fixtures).
+# The source of truth is normalizer/price_grid.PriceLadder.
 TICK = 0.01
 
-# Logit de los extremos cotizables
-# σ(LOGIT_MIN) ≈ 0.01,  σ(LOGIT_MAX) ≈ 0.99
+# Log-odds of the quotable boundaries: σ(LOGIT_MIN) ≈ 0.01, σ(LOGIT_MAX) ≈ 0.99
 LOGIT_MIN = math.log(TICK / (1 - TICK))  # ≈ -4.595
 LOGIT_MAX = math.log((1 - TICK) / TICK)  # ≈  4.595
 
+# Ladder used when the caller supplies none: one-cent steps.
+_DEFAULT_LADDER = PriceLadder.uniform(TICK)
+
+# Upper bound on the half-spread in logit space.
+#
+# Why it exists: δ_X enters σ(r̃ ± δ_X). A large δ_X saturates the sigmoid at 0
+# and 1 — a quote of "bid at zero, ask at one", which is not a quote but the
+# absence of one. Quoting wider than σ(±MAX_HALF_SPREAD_X) adds no information
+# and hides an upstream problem (σ_b blown up, τ miscomputed, κ_x absurd).
+#
+# 6.0 nats → bid ≈ 0.0025, ask ≈ 0.9975 at zero inventory. Anything beyond is
+# clamped AND the quote is marked invalid, so the symptom shows up in the trace
+# instead of propagating as a plausible-looking number.
+MAX_HALF_SPREAD_X = 6.0
 
 # ---------------------------------------------------------------------------
-# Primitivas logit
+# Default parameters — PLACEHOLDERS until calibrated on real venue data.
+#
+# Why these differ from the previous (0.1, 0.8):
+#   Those values were implicitly tuned to an incorrect rent term. Under the
+#   exact form (1/γ)·ln(1+γ/κ), κ_x = 0.8 yields a half-spread of 1.18 nats —
+#   a 53-cent spread at p=0.5, which is not a quote but a refusal to quote.
+#
+#   κ_x is now chosen by the spread it implies, which is the observable
+#   quantity: rent(γ=0.1, κ_x=12) = 0.083 nats → ≈ 4.1c spread at p=0.5,
+#   consistent with a liquid prediction market.
+#
+# This does not replace calibration: GLFTCalibrator should estimate κ_x per
+# market. These are the values to start from before any fills are observed.
+DEFAULT_GAMMA_I = 0.1
+DEFAULT_KAPPA_X = 12.0
+
+
+# ---------------------------------------------------------------------------
+# Logit primitives
 # ---------------------------------------------------------------------------
 
 
 def logit(p: float) -> float:
-    """X = logit(p) = ln(p/(1-p)). Clampea p a (ε, 1-ε)."""
+    """X = logit(p) = ln(p/(1-p)). Clamps p into (ε, 1-ε)."""
     p = max(1e-9, min(1 - 1e-9, p))
     return math.log(p / (1.0 - p))
 
 
 def sigma(x: float) -> float:
-    """p = σ(X) = 1/(1+e^{-X}). Logit inversa."""
-    return 1.0 / (1.0 + math.exp(-x))
+    """
+    p = σ(X) = 1/(1+e^{-X}). Inverse logit, numerically stable.
+
+    Why two branches:
+      The direct form 1/(1+exp(-x)) overflows with OverflowError for x < -709
+      (math.exp(710) > DBL_MAX). That happened on real data: a mis-estimated
+      σ_b blew up the half-spread and the backtester aborted with "math range
+      error" instead of producing a PnL curve.
+
+      For x ≥ 0 use 1/(1+e^{-x}) — the exponent is negative, no overflow.
+      For x < 0 use e^{x}/(1+e^{x}) — the exponent is negative again.
+      The two branches are algebraically the same function; neither overflows.
+    """
+    if x >= 0.0:
+        return 1.0 / (1.0 + math.exp(-x))
+    e = math.exp(x)
+    return e / (1.0 + e)
 
 
 def sigma_prime(x: float) -> float:
-    """σ'(X) = σ(X)·(1-σ(X)) = p(1-p). Jacobiano de la transformación."""
+    """σ'(X) = σ(X)·(1-σ(X)) = p(1-p). Jacobian of the logit transform."""
     p = sigma(x)
     return p * (1.0 - p)
 
@@ -76,80 +132,162 @@ def sigma_prime(x: float) -> float:
 @dataclass(frozen=True)
 class Quote:
     """
-    Resultado completo de un ciclo de quoting.
+    Complete result of one quoting cycle.
 
-    Contiene inputs, cálculos intermedios y outputs — todo visible
-    para debug, backtesting y logging. El execution engine solo usa
-    bid_p, ask_p e is_valid.
+    Carries inputs, intermediate quantities and outputs — everything visible
+    for debugging, backtesting and logging. The execution engine only reads
+    bid_p, ask_p and is_valid.
 
-    Por qué frozen:
-      Un Quote es una decisión tomada en un momento t. No debe
-      mutarse después de creado — si las condiciones cambian se
-      crea un nuevo Quote.
+    Why frozen:
+      A Quote is a decision taken at time t. It must not mutate after
+      construction; if conditions change, a new Quote is produced.
     """
 
-    # --- Identidad ---
+    # --- Identity ---
     market_id: MarketId
     timestamp: datetime
     model: str  # "glft" | "cartea_jaimungal"
 
-    # --- Inputs del modelo ---
-    mid_price_p: float  # p_t en espacio precio ∈ (0,1)
+    # --- Model inputs ---
+    mid_price_p: float  # p_t in price space ∈ (0,1)
     mid_price_X: float  # X_t = logit(p_t) ∈ ℝ
-    inventory: float  # q_t — posición actual del MM
-    tau_years: float  # τ = T - t en años
+    inventory: float  # q_t — current maker position
+    tau_years: float  # τ = T - t, in years
     regime: NearResolutionRegime
 
-    # --- Parámetros usados ---
+    # --- Parameters in force ---
     gamma_I: float  # γ_I — CARA inventory risk aversion
-    kappa_x: float  # κ_x — fill curve decay en logit
-    belief_vol: float  # σ_b — volatilidad instantánea de logit(p)
+    kappa_x: float  # κ_x — fill-curve decay in logit space
+    belief_vol: float  # σ_b — instantaneous volatility of logit(p)
 
-    # --- Cálculos intermedios ---
-    sigma_bar_sq: float  # σ̄²_b·τ — varianza integrada
-    reservation_X: float  # r̃_X = X - q·γ_I·σ̄²_b·τ
-    half_spread_X: float  # δ*/2 en logit
-    signal_skew: float  # componente de señal (0.0 en GLFT puro)
+    # --- Intermediate quantities ---
+    sigma_bar_sq: float  # σ̄²_b·τ — integrated variance
+    reservation_X: float  # r̃_X = X - q·γ_eff·σ̄²_b·τ
+    half_spread_X: float  # δ*/2 in logit space
+    signal_skew: float  # signal component (0.0 for pure GLFT)
 
-    # --- Quotes en logit ---
+    # --- Quotes in logit space ---
     bid_X: float  # r̃_X - δ*/2
     ask_X: float  # r̃_X + δ*/2
 
-    # --- Quotes en precio — lo que se envía al mercado ---
-    bid_p: float  # σ(bid_X), ajustado al tick si es necesario
-    ask_p: float  # σ(ask_X), ajustado al tick si es necesario
+    # --- Quotes in price space — what reaches the market ---
+    bid_p: float  # σ(bid_X), snapped to the price ladder
+    ask_p: float  # σ(ask_X), snapped to the price ladder
 
-    # --- Validez ---
-    is_valid: bool  # False → el execution engine no cotiza
-    invalid_reason: str  # "" si is_valid=True
+    # --- Validity ---
+    is_valid: bool  # False → the execution engine does not quote
+    invalid_reason: str  # "" when is_valid is True
 
     @property
     def spread_p(self) -> float:
-        """Spread en espacio precio."""
+        """Spread in price space."""
         return self.ask_p - self.bid_p
 
     @property
     def spread_X(self) -> float:
-        """Spread en espacio logit."""
+        """Spread in logit space."""
         return self.ask_X - self.bid_X
 
     @property
     def mid_quoted_p(self) -> float:
-        """Mid de los quotes cotizados en espacio precio."""
+        """Midpoint of our own quotes, in price space."""
         return (self.bid_p + self.ask_p) / 2.0
 
     def log_line(self) -> str:
-        """Una línea de log con los campos más relevantes."""
+        """Single-line log summary of the most relevant fields."""
         return (
             f"model={self.model} "
             f"p={self.mid_price_p:.4f} q={self.inventory:+.0f} "
-            f"τ={self.tau_years*365:.1f}d "
+            f"τ={self.tau_years * 365:.1f}d "
             f"σ_b={self.belief_vol:.4f} "
             f"r̃_p={sigma(self.reservation_X):.4f} "
             f"bid={self.bid_p:.4f} ask={self.ask_p:.4f} "
             f"spread={self.spread_p:.4f} "
             f"valid={self.is_valid}"
         )
+
+
+def apply_tick_floor(
+    bid_p: float,
+    ask_p: float,
+    reservation_X: float,
+    tau_years: float,
+    ladder: PriceLadder | None = None,
+) -> tuple[float, float, bool, str]:
+    """
+    Snap quotes onto the market's quotable price grid (MATH.md §5.4 eq 2.3).
+
+    Logic:
+      Both sides inside the quotable range → returned snapped to the grid.
+      Either side outside:
+        τ < TAU_1H → near resolution, do not quote (is_valid=False)
+        τ ≥ TAU_1H → anchor the pair at the minimum spread around σ(r̃_X)
+
+    Why a ladder rather than a constant:
+      TICK = 0.01 was wrong on both venues. Kalshi publishes per-market
+      `price_ranges` — 0.001 in the main band, 0.0001 in the tails — and
+      Polymarket declares minimum_tick_size = 0.001. With a fixed cent, a
+      market quoting 0.0030/0.0040 received a bid of 0.0100: buying at a cent
+      what the book offers at four tenths of one.
+
+    Args:
+        ladder: the market's grid. None falls back to a one-cent ladder, which
+                remains correct for Manifold and for venue-agnostic tests.
+
+    Returns:
+        (bid_p, ask_p, is_valid, reason)
+    """
+    grid = ladder if ladder is not None else _DEFAULT_LADDER
+
+    lo, hi = grid.min_quotable, grid.max_quotable
+
+    # Snap to the grid ALWAYS, not only when the range is violated.
+    #
+    # σ(r̃ ± δ) returns an arbitrary real — 0.003202952327837194 — which no
+    # venue accepts as a price. Previously snapping happened only inside the
+    # tick-floor branch, so the normal path emitted unquotable orders.
+    #
+    # The bid snaps DOWN and the ask snaps UP: rounding can only widen the
+    # spread, never tighten it. Rounding inward would quote more aggressively
+    # than the model actually calls for.
+    bid_snapped = grid.floor_to_grid(bid_p)
+    ask_snapped = grid.ceil_to_grid(ask_p)
+
+    if lo <= bid_snapped and ask_snapped <= hi:
+        # Normal case — both sides inside the quotable range
+        return bid_snapped, ask_snapped, True, ""
+
+    # Range violated — the response depends on τ
+    if tau_years < TAU_1H:
+        # Near resolution — stop quoting rather than invent a spread
+        return (
+            bid_p,
+            ask_p,
+            False,
+            (
+                f"tick_floor_near_resolution: "
+                f"bid={bid_p:.4f} ask={ask_p:.4f} tau_hours={tau_years * 8760:.1f}"
+            ),
+        )
+
+    # Far from expiry — anchor at the minimum quotable spread.
+    #
+    # The original adjustment was `bid = max(TICK, r-TICK/2)`, `ask =
+    # min(1-TICK, r+TICK/2)` with a guard that only fired when bid >= ask. Near
+    # the boundaries it produced SUB-TICK spreads: at r ≈ 0.0119 it gave
+    # bid=0.0100, ask=0.0169 — a 0.0069 spread that no venue accepts.
+    #
+    # Now the bid is anchored to the grid and the ask one tick above, shifting
+    # the pair if it leaves the range. The resulting spread is always exactly
+    # one tick and both sides land on the grid.
+    reservation_p = sigma(reservation_X)
+    tick = grid.tick_at(reservation_p)
+
+    bid_p_adj = grid.floor_to_grid(reservation_p - tick / 2.0)
+    bid_p_adj = min(max(bid_p_adj, lo), hi - tick)
+    ask_p_adj = grid.ceil_to_grid(bid_p_adj + tick)
+
+    return bid_p_adj, ask_p_adj, True, "tick_floor_adjusted"
 
 
 # ---------------------------------------------------------------------------
@@ -159,30 +297,31 @@ class Quote:
 
 class GLFTQuoter:
     """
-    Market maker GLFT en espacio logit — aproximación AS (§4.1).
+    GLFT market maker in logit space — AS approximation (MATH.md §5.4).
 
-    Fórmulas (MATH.md v2.1 §4.1):
+    Equations:
 
-      Varianza integrada:
-        σ̄²_b = σ²_b (constante en esta aproximación)
+      Integrated variance:
+        σ̄²_b = σ²_b (constant under this approximation)
+
+      Effective risk aversion (§6.4):
+        γ_eff = γ_I · regime_multiplier(τ)
 
       Reservation log-odds:
-        r̃_X(t,q) = X_t - q·γ_I·σ̄²_b·τ            (2.1)
+        r̃_X(t,q) = X_t − q·γ_eff·σ̄²_b·τ                        (2.1)
 
-      Optimal half-spread en logit:
-        δ*/2 = γ_I·σ̄²_b·τ/2 + (1/κ_x)·ln(1+γ_I/κ_x)  (2.2)
+      Optimal half-spread in logit space:
+        δ*/2 = γ_eff·σ̄²_b·τ/2 + (1/γ_eff)·ln(1 + γ_eff/κ_x)     (2.2)
 
-      Quotes en precio:
-        bid_p = σ(r̃_X - δ*/2)                       (2.3)
+      Quotes in price space:
+        bid_p = σ(r̃_X − δ*/2)
         ask_p = σ(r̃_X + δ*/2)
 
-      Tick floor (§4.1 eq 2.3):
-        si bid_p < TICK o ask_p > 1-TICK:
-          τ < TAU_1H → is_valid=False
-          τ ≥ TAU_1H → ajustar spread a TICK alrededor de σ(r̃_X)
+      Tick floor (eq 2.3): both sides snapped to the market's price ladder;
+      outside the quotable range, τ decides whether to widen or stop quoting.
 
-    Uso:
-        quoter = GLFTQuoter(gamma_I=0.1, kappa_x=0.8)
+    Usage:
+        quoter = GLFTQuoter(gamma_I=DEFAULT_GAMMA_I, kappa_x=DEFAULT_KAPPA_X)
         quote  = quoter.quote(
             market_id=mid,
             mid_p=0.45,
@@ -202,13 +341,12 @@ class GLFTQuoter:
     ) -> None:
         """
         Args:
-            gamma_I: CARA inventory risk aversion (1/$).
-                     Leer desde config.kalshi_config.risk.gamma.
-                     Mayor γ_I → spreads más anchos, menos inventario.
+            gamma_I: CARA inventory risk aversion (1/$). Higher γ_I widens
+                     spreads and shrinks the inventory the maker will carry.
 
-            kappa_x: fill curve decay en espacio logit (adimensional).
-                     Calibrado desde GLFTCalibrator — campo kappa_x del resultado.
-                     Mayor κ_x → fills más sensibles al spread.
+            kappa_x: fill-curve decay in logit space (dimensionless), estimated
+                     by GLFTCalibrator. Higher κ_x means fills are more
+                     sensitive to the quoted spread.
         """
         if gamma_I <= 0:
             raise ValueError(f"gamma_I must be positive, got {gamma_I}")
@@ -227,26 +365,32 @@ class GLFTQuoter:
         belief_vol: float,
         regime: NearResolutionRegime,
         timestamp: datetime | None = None,
+        ladder: PriceLadder | None = None,
     ) -> Quote:
         """
-        Calcula los quotes óptimos para el estado actual del mercado.
+        Compute the optimal quotes for the current market state.
 
         Args:
-            market_id:  identificador canónico del mercado
-            mid_p:      mid-price actual ∈ (0, 1)
-            inventory:  posición actual del MM en contratos (signed)
-            tau_years:  tiempo hasta resolución en años
-            belief_vol: σ_b — volatilidad instantánea de logit(p),
-                        calculada por belief_vol_from_ticks() en microstructure.py
-            regime:     NearResolutionRegime desde resolution.py
+            market_id:  canonical market identifier
+            mid_p:      current mid price ∈ (0, 1)
+            inventory:  current signed maker position, in contracts
+            tau_years:  time to resolution, in years
+            belief_vol: σ_b — instantaneous volatility of logit(p), produced by
+                        belief_vol_from_ticks() in features/microstructure.py
+            regime:     NearResolutionRegime from features/resolution.py
+            ladder:     the market's quotable price grid. None falls back to the
+                        venue default, which is correct unless Kalshi publishes
+                        a per-market ladder — in which case pass the one carried
+                        on Market.price_ladder.
 
         Returns:
-            Quote con todos los campos. El execution engine solo necesita
-            is_valid, bid_p y ask_p.
+            A fully populated Quote. The execution engine only needs is_valid,
+            bid_p and ask_p.
         """
         ts = timestamp or datetime.now(tz=UTC)
+        grid = ladder if ladder is not None else ladder_for_venue(market_id.venue)
 
-        # --- Halt inmediato si el régimen lo requiere ---
+        # --- Immediate halt when the regime demands it ---
         if regime in (NearResolutionRegime.HALT, NearResolutionRegime.RESOLVED):
             return self._invalid_quote(
                 market_id=market_id,
@@ -259,47 +403,120 @@ class GLFTQuoter:
                 reason=f"regime={regime.value}",
             )
 
-        # --- Estado en espacio logit ---
+        # --- State in logit space ---
         X_t = logit(mid_p)
 
-        # --- Varianza integrada σ̄²_b·τ ---
-        # En esta aproximación σ_b es constante → σ̄²_b = σ²_b
-        # En una versión futura: integrar σ²_b(u) sobre [t,T]
+        # --- Integrated variance σ̄²_b·τ ---
+        # Under this approximation σ_b is constant, so σ̄²_b = σ²_b.
+        # A later version would integrate σ²_b(u) over [t,T].
         sigma_bar_sq = belief_vol**2 * tau_years
 
-        # --- Reservation log-odds (2.1) ---
-        # r̃_X = X_t - q·γ_I·σ̄²_b·τ
-        # El skew de inventario desplaza el centro de los quotes:
-        #   q > 0 (long) → r̃_X < X_t → cotizar más bajo para vender
-        #   q < 0 (short) → r̃_X > X_t → cotizar más alto para comprar
-        reservation_X = X_t - inventory * self.gamma_I * sigma_bar_sq
-
-        # --- Optimal half-spread en logit (2.2) ---
-        # δ*/2 = γ_I·σ̄²_b·τ/2 + (1/κ_x)·ln(1 + γ_I/κ_x)
+        # --- Effective risk aversion (§6.4) ---
+        # γ_eff = γ_I · regime multiplier: ×1 NORMAL, ×2 WARNING, ×4 CRITICAL.
         #
-        # Primer término: compensación por riesgo de inventario
-        # Segundo término: "microstructure rent" — cota inferior del spread
-        #   independiente del inventario y del tiempo (asintóticamente)
-        inventory_term = self.gamma_I * sigma_bar_sq / 2.0
-        rent_term = (1.0 / self.kappa_x) * math.log(1.0 + self.gamma_I / self.kappa_x)
+        # Through v2.1 this multiplier was computed in resolution.py and ignored
+        # here, which made the whole near-resolution extension of MATH.md §6
+        # decorative: the system neither widened spreads nor reduced inventory
+        # appetite as resolution approached — it only stopped quoting under five
+        # minutes.
+        gamma_eff = effective_gamma_for_regime(self.gamma_I, regime)
+
+        # --- Reservation log-odds (2.1) ---
+        # r̃_X = X_t − q·γ_eff·σ̄²_b·τ
+        # Inventory skew shifts the centre of the quotes:
+        #   q > 0 (long)  → r̃_X < X_t → quote lower to sell down
+        #   q < 0 (short) → r̃_X > X_t → quote higher to buy back
+        reservation_X = X_t - inventory * gamma_eff * sigma_bar_sq
+
+        # --- Optimal half-spread in logit space (2.2) ---
+        # δ*/2 = γ_eff·σ̄²_b·τ/2 + (1/γ_eff)·ln(1 + γ_eff/κ_x)
+        #
+        # First term:  compensation for inventory risk.
+        # Second term: the microstructure rent — a lower bound on the spread,
+        #              asymptotically independent of inventory and of time.
+        #
+        # The rent term is the EXACT first-order condition from A-S (§2.4), not
+        # the (1/κ_x)·ln(1+γ/κ_x) approximation used through v2.1. That
+        # expression is neither the exact form nor its γ≪κ limit (which is
+        # 1/κ_x); it sits below both. At γ_I=0.1, κ_x=0.8 it understated the
+        # rent eightfold.
+        inventory_term = gamma_eff * sigma_bar_sq / 2.0
+        rent_term = (1.0 / gamma_eff) * math.log1p(gamma_eff / self.kappa_x)
         half_spread_X = inventory_term + rent_term
 
-        # --- Quotes en logit ---
+        # --- Sanity bound on the half-spread ---
+        # A runaway δ_X does not produce a wide quote, it produces σ(±δ) = {0,1},
+        # which is not quoting at all. Clamp AND mark the quote invalid so the
+        # cause (σ_b blown up, absurd τ, uncalibrated κ_x) is visible in the
+        # trace rather than propagating as a plausible-looking number.
+        half_spread_clamped = False
+        if not math.isfinite(half_spread_X) or half_spread_X > MAX_HALF_SPREAD_X:
+            log.warning(
+                "half_spread_clamped: market=%s raw=%.4g max=%.2f "
+                "belief_vol=%.4g tau_years=%.4g gamma_eff=%.4g kappa_x=%.4g",
+                market_id,
+                half_spread_X,
+                MAX_HALF_SPREAD_X,
+                belief_vol,
+                tau_years,
+                gamma_eff,
+                self.kappa_x,
+            )
+            half_spread_X = MAX_HALF_SPREAD_X
+            half_spread_clamped = True
+
+        # --- Quotes in logit space ---
         bid_X = reservation_X - half_spread_X
         ask_X = reservation_X + half_spread_X
 
-        # --- Mapear a espacio precio via σ(X) ---
+        # --- Map back to price space via σ(X) ---
         bid_p_raw = sigma(bid_X)
         ask_p_raw = sigma(ask_X)
 
-        # --- Tick floor (§4.1 eq 2.3) ---
-        bid_p, ask_p, is_valid, reason = self._apply_tick_floor(
+        # --- Tick floor (§5.4 eq 2.3) ---
+        bid_p, ask_p, is_valid, reason = apply_tick_floor(
             bid_p=bid_p_raw,
             ask_p=ask_p_raw,
             reservation_X=reservation_X,
             tau_years=tau_years,
-            regime=regime,
+            ladder=grid,
         )
+
+        # --- Coherence guard: the quote must straddle the reservation price ---
+        #
+        # The correct invariant is bid ≤ σ(r̃_X) ≤ ask, NOT bid ≤ mid ≤ ask.
+        # A maker carrying inventory deliberately shifts BOTH quotes to the same
+        # side of the mid in order to flatten; requiring them to straddle the
+        # mid rejected exactly the inventory skew the model exists to produce.
+        #
+        # (An earlier version did check against the mid. It was a patch for the
+        # global 0.01 tick, which pushed the bid to 0.0100 in markets quoting in
+        # thousandths. Per-venue ladders removed that cause, at which point the
+        # patch became actively harmful.)
+        reservation_p = sigma(reservation_X)
+        if not (bid_p <= reservation_p <= ask_p):
+            log.warning(
+                "quote_does_not_straddle_reservation: market=%s r=%.4f bid=%.4f ask=%.4f",
+                market_id,
+                reservation_p,
+                bid_p,
+                ask_p,
+            )
+            is_valid = False
+            reason = (
+                f"quote_does_not_straddle_reservation: r={reservation_p:.4f} "
+                f"bid={bid_p:.4f} ask={ask_p:.4f}"
+            )
+
+        # A clamped half-spread means the model left its range of validity. The
+        # quote is still returned, but marked invalid so the router will not
+        # send it and the symptom stays visible in the trace.
+        if half_spread_clamped:
+            is_valid = False
+            reason = (
+                f"half_spread_clamped: belief_vol={belief_vol:.4g} "
+                f"tau_years={tau_years:.4g} kappa_x={self.kappa_x:.4g}"
+            )
 
         return Quote(
             market_id=market_id,
@@ -325,60 +542,6 @@ class GLFTQuoter:
             invalid_reason=reason,
         )
 
-    def _apply_tick_floor(
-        self,
-        bid_p: float,
-        ask_p: float,
-        reservation_X: float,
-        tau_years: float,
-        regime: NearResolutionRegime,
-    ) -> tuple[float, float, bool, str]:
-        """
-        Aplica el tick floor de §4.1 (ecuación 2.3).
-
-        Lógica:
-          Si bid_p ≥ TICK y ask_p ≤ 1-TICK → quotes válidos, sin ajuste
-          Si alguno viola el tick:
-            τ < TAU_1H → near-resolution, is_valid=False
-            τ ≥ TAU_1H → ajustar spread al tick mínimo alrededor de σ(r̃_X)
-
-        Returns:
-            (bid_p, ask_p, is_valid, reason)
-        """
-        # Verificar si algún quote viola el tick
-        bid_below = bid_p < TICK
-        ask_above = ask_p > 1.0 - TICK
-
-        if not bid_below and not ask_above:
-            # Caso normal — quotes válidos sin ajuste
-            return bid_p, ask_p, True, ""
-
-        # Violación detectada — decidir según τ
-        if tau_years < TAU_1H:
-            # Near-resolution — no cotizar
-            return (
-                bid_p,
-                ask_p,
-                False,
-                (
-                    f"tick_floor_near_resolution: "
-                    f"bid={bid_p:.4f} ask={ask_p:.4f} tau_hours={tau_years*8760:.1f}"
-                ),
-            )
-
-        # Lejos de vencimiento — ajustar spread al tick mínimo
-        # Mantener el reservation_p como centro y poner spread = TICK
-        reservation_p = sigma(reservation_X)
-        bid_p_adj = max(TICK, reservation_p - TICK / 2.0)
-        ask_p_adj = min(1.0 - TICK, reservation_p + TICK / 2.0)
-
-        # Verificar que el ajuste es coherente
-        if bid_p_adj >= ask_p_adj:
-            bid_p_adj = TICK
-            ask_p_adj = 2 * TICK
-
-        return bid_p_adj, ask_p_adj, True, "tick_floor_adjusted"
-
     def _invalid_quote(
         self,
         market_id: MarketId,
@@ -390,7 +553,7 @@ class GLFTQuoter:
         regime: NearResolutionRegime,
         reason: str,
     ) -> Quote:
-        """Construye un Quote inválido — para casos de halt o near-resolution."""
+        """Build an invalid Quote — for halt and near-resolution cases."""
         X_t = logit(mid_p)
         return Quote(
             market_id=market_id,

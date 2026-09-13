@@ -1,6 +1,11 @@
 # We need a schema file that translates those different formats into a common one
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from normalizer.price_grid import PriceLadder
+
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from enum import Enum
@@ -28,12 +33,12 @@ class Venue(str, Enum):
 
 class MarketStatus(str, Enum):
     OPEN = "open"
-    CLOSED = "closed"  # trading parado, no resuelto aún
+    CLOSED = "closed"  # trading stopped, not yet resolved
     RESOLVED = "resolved"  # resultado conocido
 
 
 class TickType(str, Enum):
-    QUOTE = "quote"  # actualización de mid-price desde el orderbook
+    QUOTE = "quote"  # a mid-price update from the order book
     TRADE = "trade"  # fill real
 
 
@@ -151,6 +156,17 @@ class Tick:
     volume: Size = Size(0.0)
     side: Side | None = None
 
+    # Venue-native event identifier (Manifold bet id, Kalshi/Polymarket trade
+    # id). This is the deduplication key: without it, a writer retry is
+    # indistinguishable from two genuine trades in the same millisecond — and
+    # those are the common case. In the current database, of the 2,264 groups
+    # sharing (market_id, timestamp) only 399 were true duplicates; the rest were a
+    # `yes` and a `no` matched at the same instant.
+    #
+    # None for quotes, which have no identity of their own. The unique index
+    # ignores them because in SQL two NULLs are distinct.
+    source_id: str | None = None
+
     def __post_init__(self) -> None:
         if not 0.0 <= self.yes_bid <= 1.0:
             raise ValueError(f"yes_bid must be in [0,1], got {self.yes_bid}")
@@ -178,6 +194,10 @@ class Market:
     resolution: Resolution
     status: MarketStatus
     created_at: datetime = field(default_factory=utcnow)
+
+    # The market's quotable price grid (Kalshi publishes one per market via
+    # `price_ranges`). None = fall back to the venue default ladder.
+    price_ladder: PriceLadder | None = None
 
     def is_tradeable(self) -> bool:
         return self.status == MarketStatus.OPEN

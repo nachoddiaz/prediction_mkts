@@ -1,7 +1,7 @@
 """
 backtesting/scenarios/base_scenario.py
 ──────────────────────────────────────
-Clase base y utilidades para escenarios de backtesting y sweeps de parámetros.
+Base class and helpers for backtesting scenarios and parameter sweeps.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ log = logging.getLogger(__name__)
 
 class BaseScenario:
     """
-    Clase base para construir escenarios y ejecutar análisis cuantitativos ( sweeps).
+    Base class for building scenarios and running quantitative sweeps.
     """
 
     def __init__(self, db_path: str, market_id: str) -> None:
@@ -40,7 +40,7 @@ class BaseScenario:
         risk_params: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], pd.DataFrame]:
         """
-        Ejecuta una corrida de backtest simple.
+        Run a single backtest.
         """
         engine = BacktestEngine(
             db_path=self.db_path,
@@ -68,7 +68,7 @@ class BaseScenario:
         risk_params: dict[str, Any] | None = None,
     ) -> list[dict[str, Any]]:
         """
-        Ejecuta sweeps de parámetros sobre una única variable y muestra una tabla de comparación.
+        Sweep one parameter and print a comparison table.
         """
         results = []
 
@@ -100,7 +100,7 @@ class BaseScenario:
         self, strategy_name: str, param_name: str, results: list[dict[str, Any]]
     ) -> None:
         """
-        Imprime una tabla comparativa estilizada con los resultados del sweep de parámetros.
+        Print a formatted comparison table of the sweep results.
         """
         table = Table(
             title=f"Parameter Sweep on Strategy: {strategy_name.upper()} ({self.market_id})",

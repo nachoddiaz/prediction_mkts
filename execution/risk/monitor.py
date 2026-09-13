@@ -1,7 +1,7 @@
 """
 execution/risk/monitor.py
 ──────────────────────────
-Métricas en tiempo real, cálculo de PnL y seguimiento de pérdida diaria acumulada.
+Real-time metrics, PnL computation and cumulative daily-loss tracking.
 """
 
 from __future__ import annotations
@@ -15,17 +15,17 @@ log = logging.getLogger(__name__)
 
 class RiskMonitor:
     """
-    Monitoriza la salud financiera y operativa de la cuenta.
+    Monitors the account's financial and operational health.
 
-    Cálculo de Equity:
-      Equity = Saldo en Caja + Sumatorio(Posición * Mid-Price)
+    Equity computation:
+      Equity = cash balance + Σ(position * mid price)
 
-    Cálculo de Pérdida Diaria:
+    Daily-loss computation:
       Daily Loss = max(0.0, Initial Cash - Current Equity)
 
-    Estadísticas adicionales:
+    Additional statistics:
       - Volumen total transaccionado (en contratos/shares).
-      - Número de ejecuciones exitosas.
+      - Number of successful executions.
     """
 
     def __init__(self, initial_cash: float) -> None:
@@ -34,23 +34,23 @@ class RiskMonitor:
         self._pnl: float = 0.0
         self._daily_loss: float = 0.0
 
-        # Métricas operativas
+        # Operational metrics
         self.total_trades: int = 0
         self.total_volume: float = 0.0
 
     @property
     def current_equity(self) -> float:
-        """Valor total estimado de la cuenta (Caja + Valor de Posiciones)."""
+        """Estimated total account value (cash + position value)."""
         return self._current_equity
 
     @property
     def pnl(self) -> float:
-        """PnL acumulado respecto al balance inicial."""
+        """Cumulative PnL against the starting balance."""
         return self._pnl
 
     @property
     def daily_loss(self) -> float:
-        """Pérdida acumulada respecto al balance inicial (siempre >= 0)."""
+        """Cumulative loss against the starting balance (always >= 0)."""
         return self._daily_loss
 
     def update(
@@ -60,26 +60,26 @@ class RiskMonitor:
         mid_prices: dict[MarketId, float],
     ) -> float:
         """
-        Actualiza el estado de valoración del portfolio y recalcula el PnL.
+        Update the portfolio valuation and recompute PnL.
 
         Args:
-            cash_balance: Saldo actual en efectivo.
-            positions:    Diccionario con la posición firmada de YES por mercado.
-            mid_prices:   Diccionario con el último mid-price de cada mercado (probabilidad).
+            cash_balance: the current cash balance.
+            positions:    signed YES position per market.
+            mid_prices:   latest mid price per market (as a probability).
 
         Returns:
-            La pérdida acumulada en el día (daily_loss).
+            The day's cumulative loss (daily_loss).
         """
         position_value = 0.0
         for m_id, pos in positions.items():
-            # Si no tenemos mid-price reciente, usamos 0.5 por defecto
+            # Without a recent mid price, fall back to 0.5
             mid = mid_prices.get(m_id, 0.5)
             position_value += pos * mid
 
         self._current_equity = cash_balance + position_value
         self._pnl = self._current_equity - self.initial_cash
 
-        # Pérdida es la diferencia negativa con respecto al capital inicial
+        # Loss is the negative difference against the initial capital
         self._daily_loss = max(0.0, -self._pnl)
 
         log.debug(
@@ -89,7 +89,7 @@ class RiskMonitor:
         return self._daily_loss
 
     def record_trade(self, size: float, price: float) -> None:
-        """Registra una ejecución en las métricas operativas de volumen."""
+        """Record one execution in the operational volume metrics."""
         self.total_trades += 1
         self.total_volume += size
         log.info(

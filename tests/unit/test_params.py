@@ -3,19 +3,15 @@ tests/unit/test_params.py
 ──────────────────────────
 Tests de strategies/market_making/params.py
 
-Por qué datos sintéticos y no DuckDB:
-  Los calibradores reciben DataFrames — podemos construir
-  datos con propiedades conocidas y verificar que el calibrador
-  recupera los parámetros correctos.
+Why synthetic data rather than DuckDB:
+  With synthetic data we know the true parameters, so we can verify the
+  calibrator recovers the right ones. If we generate an AR(1) with a known φ,
+  the calibrator must estimate φ close to that value.
 
-  Ejemplo: si generamos una serie AR(1) con α=0.95 y φ=-ln(0.95)/Δt,
-  el calibrador debe estimar φ cerca de ese valor.
+  Tests against real data would only check the code runs, not that it computes
+  the right answer — and a wrong estimator would still pass the asserts.
 
-Cada test imprime por pantalla los inputs y outputs para verificar
-visualmente que los valores tienen sentido económico, no solo que
-pasan los asserts.
-
-Ejecutar con -s para ver el output:
+Run with -s to see the output:
     uv run pytest tests/unit/test_params.py -v -s
 """
 
@@ -74,7 +70,7 @@ def divider() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Helpers para generar datos sintéticos
+# Helpers for generating synthetic data
 # ---------------------------------------------------------------------------
 
 
@@ -144,7 +140,7 @@ def make_features_df(
 
 
 class TestGLFTCalibrator:
-    def test_devuelve_glft_result(self) -> None:
+    def test_returns_glft_result(self) -> None:
         section("GLFT — devuelve GLFTResult")
 
         df = make_ticks_df(n=200)
@@ -163,7 +159,7 @@ class TestGLFTCalibrator:
 
         assert isinstance(result, GLFTResult)
 
-    def test_kappa_positivo(self) -> None:
+    def test_kappa_is_positive(self) -> None:
         section("GLFT — κ siempre positivo")
 
         df = make_ticks_df(n=200)
@@ -190,7 +186,7 @@ class TestGLFTCalibrator:
 
         assert result.A > 0
 
-    def test_n_observations_correcto(self) -> None:
+    def test_n_observations_is_correct(self) -> None:
         section("GLFT — n_observations consistente")
 
         n = 200
@@ -206,7 +202,7 @@ class TestGLFTCalibrator:
         assert result.n_observations <= n
         assert result.n_observations > 0
 
-    def test_log_likelihood_es_float(self) -> None:
+    def test_log_likelihood_is_float(self) -> None:
         section("GLFT — log-likelihood es float")
 
         df = make_ticks_df(n=200)
@@ -218,7 +214,7 @@ class TestGLFTCalibrator:
 
         assert isinstance(result.log_likelihood, float)
 
-    def test_to_dict_tiene_kappa_y_A(self) -> None:
+    def test_to_dict_has_kappa_and_A(self) -> None:
         section("GLFT — to_dict() tiene κ y A")
 
         df = make_ticks_df(n=200)
@@ -232,7 +228,7 @@ class TestGLFTCalibrator:
         assert "kappa_p" in d
         assert "A" in d
 
-    def test_summary_es_string(self) -> None:
+    def test_summary_is_a_string(self) -> None:
         section("GLFT — summary() es string legible")
 
         df = make_ticks_df(n=200)
@@ -244,7 +240,7 @@ class TestGLFTCalibrator:
         assert isinstance(s, str)
         assert "κ" in s
 
-    def test_raises_con_pocos_ticks(self) -> None:
+    def test_raises_with_too_few_ticks(self) -> None:
         section("GLFT — ValueError con pocos ticks")
 
         n = MIN_TICKS_GLFT - 1
@@ -259,7 +255,7 @@ class TestGLFTCalibrator:
         output_field("exception", type(exc_info.value).__name__)
         output_field("message", str(exc_info.value)[:60])
 
-    def test_spread_estrecho_vs_ancho(self) -> None:
+    def test_narrow_versus_wide_spread(self) -> None:
         section("GLFT — spread estrecho vs ancho")
 
         df_narrow = make_ticks_df(n=300, spread=0.01, seed=1)
@@ -281,11 +277,11 @@ class TestGLFTCalibrator:
         assert r_narrow.kappa_p > 0
         assert r_wide.kappa_p > 0
 
-    def test_raises_columna_faltante(self) -> None:
+    def test_raises_on_missing_column(self) -> None:
         section("GLFT — ValueError si falta columna spread")
 
         df = make_ticks_df(n=200).drop(columns=["spread"])
-        input_field("columnas", list(df.columns))
+        input_field("columns", list(df.columns))
         input_field("spread?", "spread" in df.columns)
 
         with pytest.raises(ValueError, match="Column") as exc_info:
@@ -294,7 +290,7 @@ class TestGLFTCalibrator:
         output_field("exception", type(exc_info.value).__name__)
         output_field("message", str(exc_info.value)[:60])
 
-    def test_columna_alternativa(self) -> None:
+    def test_alternative_column(self) -> None:
         section("GLFT — columna spread alternativa")
 
         df = make_ticks_df(n=200).rename(columns={"spread": "quoted_spread"})
@@ -314,7 +310,7 @@ class TestGLFTCalibrator:
 
 
 class TestCJCalibrator:
-    def test_devuelve_cj_result(self) -> None:
+    def test_returns_cj_result(self) -> None:
         section("CJ — devuelve CJResult")
 
         ticks = make_ticks_df(n=300)
@@ -339,7 +335,7 @@ class TestCJCalibrator:
 
         assert isinstance(result, CJResult)
 
-    def test_phi_positivo(self) -> None:
+    def test_phi_is_positive(self) -> None:
         section("CJ — φ siempre positivo")
 
         ticks = make_ticks_df(n=300)
@@ -352,7 +348,7 @@ class TestCJCalibrator:
 
         assert result.phi > 0
 
-    def test_eta_positivo(self) -> None:
+    def test_eta_is_positive(self) -> None:
         section("CJ — η siempre positivo")
 
         ticks = make_ticks_df(n=300)
@@ -365,7 +361,7 @@ class TestCJCalibrator:
 
         assert result.eta > 0
 
-    def test_rho_en_rango(self) -> None:
+    def test_rho_within_range(self) -> None:
         section("CJ — ρ ∈ [-0.99, 0.99]")
 
         ticks = make_ticks_df(n=300)
@@ -378,7 +374,7 @@ class TestCJCalibrator:
 
         assert -0.99 <= result.rho <= 0.99
 
-    def test_ar1_alpha_en_rango(self) -> None:
+    def test_ar1_alpha_within_range(self) -> None:
         section("CJ — α AR(1) ∈ (0, 1)")
 
         ticks = make_ticks_df(n=300)
@@ -390,7 +386,7 @@ class TestCJCalibrator:
 
         assert 0 < result.ar1_alpha < 1
 
-    def test_signal_r2_en_rango(self) -> None:
+    def test_signal_r2_within_range(self) -> None:
         section("CJ — R² Ridge ∈ [0, 1]")
 
         ticks = make_ticks_df(n=300)
@@ -403,7 +399,7 @@ class TestCJCalibrator:
 
         assert 0.0 <= result.signal_r2 <= 1.0
 
-    def test_to_dict_tiene_todos_los_campos(self) -> None:
+    def test_to_dict_has_every_field(self) -> None:
         section("CJ — to_dict() tiene todos los campos")
 
         ticks = make_ticks_df(n=300)
@@ -418,7 +414,7 @@ class TestCJCalibrator:
         required = {"phi", "eta", "rho", "w_obi", "w_news", "w_onchain"}
         assert required.issubset(d.keys())
 
-    def test_summary_es_string(self) -> None:
+    def test_summary_is_a_string(self) -> None:
         section("CJ — summary() legible")
 
         ticks = make_ticks_df(n=300)
@@ -431,7 +427,7 @@ class TestCJCalibrator:
         assert isinstance(s, str)
         assert "φ" in s and "η" in s and "ρ" in s
 
-    def test_raises_con_pocos_ticks(self) -> None:
+    def test_raises_with_too_few_ticks(self) -> None:
         section("CJ — ValueError con pocos ticks")
 
         n = MIN_TICKS_CJ - 1
@@ -447,7 +443,7 @@ class TestCJCalibrator:
         output_field("exception", type(exc_info.value).__name__)
         output_field("message", str(exc_info.value)[:60])
 
-    def test_mayor_senal_mayor_w_obi(self) -> None:
+    def test_stronger_signal_raises_w_obi(self) -> None:
         section("CJ — mayor señal OBI → mayor w_obi")
 
         ticks = make_ticks_df(n=500, seed=42)
@@ -470,7 +466,7 @@ class TestCJCalibrator:
 
         assert abs(r_strong.w_obi) >= abs(r_weak.w_obi) * 0.5
 
-    def test_serie_constante_no_lanza(self) -> None:
+    def test_constant_series_does_not_raise(self) -> None:
         section("CJ — señal constante no lanza excepción")
 
         ticks = make_ticks_df(n=300)
@@ -485,12 +481,12 @@ class TestCJCalibrator:
         output_field("phi", f"{result.phi:.4f}")
         output_field("eta", f"{result.eta:.8f}")
         output_field("w_obi", f"{result.w_obi:.6f}")
-        output_field("no excepción", True)
+        output_field("no exception", True)
 
         assert isinstance(result, CJResult)
         assert result.phi > 0
 
-    def test_sin_columna_obi(self) -> None:
+    def test_without_obi_column(self) -> None:
         section("CJ — sin columna OBI → pesos = 0")
 
         ticks = make_ticks_df(n=300)
@@ -506,7 +502,7 @@ class TestCJCalibrator:
 
         assert result.w_obi == 0.0
 
-    def test_ar1_recupera_alpha_sintetico(self) -> None:
+    def test_ar1_recovers_synthetic_alpha(self) -> None:
         section("CJ — AR(1) recupera α sintético conocido")
 
         rng = np.random.default_rng(0)

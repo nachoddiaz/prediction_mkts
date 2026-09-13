@@ -1,7 +1,7 @@
 """
 tests/unit/test_paper_engine.py
 ────────────────────────────────
-Tests unitarios para el motor de ejecución simulada (PaperExecutionEngine).
+Unit tests for the simulated execution engine (PaperExecutionEngine).
 """
 
 from __future__ import annotations
@@ -39,12 +39,12 @@ def engine() -> PaperExecutionEngine:
 
 
 def test_buy_limit_crossed_by_ask(engine, market_id):
-    """Verifica que una orden de compra se llene si la mejor oferta del mercado cruza su precio."""
+    """A buy order fills when the market's best offer crosses its price."""
     account = engine.account
     order = account.create_order(market_id, OrderAction.BUY, Price(0.45), Size(10.0))
     order.status = OrderStatus.ACTIVE
 
-    # Generar un tick de Quote donde el ask del mercado baja a 0.44 (cruzando nuestra compra a 0.45)
+    # A quote tick where the market ask drops to 0.44, crossing our 0.45 buy
     tick = Tick(
         market_id=market_id,
         timestamp=datetime.now(UTC),
@@ -62,14 +62,14 @@ def test_buy_limit_crossed_by_ask(engine, market_id):
 
 def test_buy_limit_passive_trade(engine, market_id):
     """
-    Verifica el llenado pasivo de una orden de compra si hay un trade a precio
+    Verifies passive filling of a buy order when a trade prints at a price
     inferior o igual.
     """
     account = engine.account
     order = account.create_order(market_id, OrderAction.BUY, Price(0.40), Size(10.0))
     order.status = OrderStatus.ACTIVE
 
-    # Generar un tick de TRADE a 0.39 con volumen 4.0
+    # Generate a TRADE tick at 0.39 with volume 4.0
     tick = Tick(
         market_id=market_id,
         timestamp=datetime.now(UTC),
@@ -83,17 +83,17 @@ def test_buy_limit_passive_trade(engine, market_id):
     filled = engine.process_tick(tick)
     assert len(filled) == 1
     assert filled[0].status == OrderStatus.ACTIVE
-    assert filled[0].filled_size == 4.0  # limitada por volumen de trade
+    assert filled[0].filled_size == 4.0  # capped by the trade's volume
     assert account.get_position(market_id) == 4.0
 
 
 def test_sell_limit_crossed_by_bid(engine, market_id):
-    """Verifica que una orden de venta se llene si la mejor demanda del mercado cruza su precio."""
+    """A sell order fills when the market's best bid crosses its price."""
     account = engine.account
     order = account.create_order(market_id, OrderAction.SELL, Price(0.55), Size(5.0))
     order.status = OrderStatus.ACTIVE
 
-    # Ticker con bid a 0.56 (cruzando nuestra venta a 0.55)
+    # Ticker with a bid at 0.56 (crossing our sell at 0.55)
     tick = Tick(
         market_id=market_id,
         timestamp=datetime.now(UTC),
@@ -109,10 +109,10 @@ def test_sell_limit_crossed_by_bid(engine, market_id):
 
 
 def test_process_snapshot_crossing(engine, market_id):
-    """Verifica ejecuciones al procesar snapshots de orderbook completo."""
+    """Verify executions when processing full order book snapshots."""
     account = engine.account
 
-    # Colocar ordenes activa de compra y venta
+    # Place active buy and sell orders
     buy_order = account.create_order(market_id, OrderAction.BUY, Price(0.52), Size(10.0))
     buy_order.status = OrderStatus.ACTIVE
 

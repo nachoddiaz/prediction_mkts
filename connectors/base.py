@@ -1,24 +1,23 @@
 """
 connectors/base.py
 ───────────────────
-Interfaz abstracta común para todos los connectors.
+Common abstract interface for every connector.
 
-Por qué una clase abstracta y no un protocolo (typing.Protocol):
-  Protocol es más flexible pero no fuerza la implementación.
-  ABC lanza NotImplementedError en runtime si un subclase olvida
-  implementar un método — fallo rápido y claro durante el desarrollo.
+Why an abstract base class and not a typing.Protocol:
+  Protocol is more flexible but does not enforce implementation. An ABC raises
+  NotImplementedError at runtime if a subclass forgets a method — a fast,
+  clear failure during development.
 
-Por qué los métodos HTTP (_get, _post) están aquí y no en cada connector:
-  Retry, timeout y logging son idénticos en todos los connectors.
-  Implementarlos una vez en la base evita duplicación y garantiza
-  comportamiento consistente ante errores de red.
+Why the HTTP helpers (_get, _post) live here rather than in each connector:
+  Retry, timeout and logging are identical across every connector.
+  Implementing them once in the base avoids duplication and guarantees
+  consistent behaviour under network errors.
 
-Por qué los callbacks en subscribe son Callable y no queues:
-  Los callbacks permiten que el caller decida qué hacer con cada
-  evento — escribir en DuckDB, calcular features, loguear, o todo
-  a la vez. Con una queue el connector tendría que saber quién
-  la consume. Con callbacks el connector es completamente agnóstico
-  del destino de los datos.
+Why the subscribe callbacks are Callables and not queues:
+  Callbacks let the caller decide what to do with each event — write it to
+  DuckDB, compute features, log it, feed a strategy, or all of them. With a
+  queue the connector would need to know who consumes the data; callbacks
+  keep it entirely agnostic about the destination.
 """
 
 from __future__ import annotations
@@ -30,51 +29,83 @@ from collections.abc import Awaitable, Callable
 
 import aiohttp
 
-from normalizer.schema import Market, MarketSnapshot, Tick
+from normalizer.schema import Market, MarketSnapshot, MarketStatus, Tick
 
 log = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
-# Tipos de los callbacks
+# An explicit and TRUTHFUL User-Agent on every request.
 #
-# Por qué Awaitable[None] y no solo None:
-#   Los callbacks se llaman desde un loop async. Si el callback hace
-#   I/O (escribir en DuckDB, calcular features), necesita ser awaitable.
-#   Awaitable[None] permite tanto funciones async como coroutines.
+# Why not a browser User-Agent:
+#   "Mozilla/5.0 ... Chrome/124" was tried, and Cloudflare ended up returning
+#   403 (an HTML challenge) from the second request against clob.polymarket.com
+#   onwards. The block turned out to be transient — repeating the experiment
+#   later, all three UA variants passed — but the operational conclusion
+#   stands: a browser UA with no cookies and no JS execution is a bot
+#   signature, and it only attracts anti-bot heuristics without buying
+#   anything in return.
+#
+#   Our own identifier passes just as well on both venues (verified, 4/4
+#   requests returning 200 on Kalshi and Polymarket) and additionally lets the
+#   venue identify us if rate limits ever need discussing.
+USER_AGENT = "prediction-market-system/0.1.0 (+https://github.com/nachoddiaz)"
+
+# ---------------------------------------------------------------------------
+# Callback types
+#
+# Why Awaitable[None] and not plain None:
+#   Callbacks are invoked from an async loop. If a callback performs blocking
+#   I/O (writing to DuckDB, computing features) it needs to be awaitable.
+#   Awaitable[None] accepts both async functions and coroutines.
 # ---------------------------------------------------------------------------
 
 TickCallback = Callable[[Tick], Awaitable[None]]
 SnapshotCallback = Callable[[MarketSnapshot], Awaitable[None]]
 
 # ---------------------------------------------------------------------------
-# Constantes de retry
+# Retry constants
 #
-# Por qué exponential backoff:
-#   Si la API de Kalshi cae momentáneamente, hacer retry inmediato
-#   satura el servidor y puede resultar en ban de IP.
-#   Con backoff exponencial el primer retry espera 1s, el segundo 2s,
-#   el tercero 4s — da tiempo a que el servidor se recupere.
+# Why exponential backoff:
+#   If the Kalshi API goes down momentarily, retrying immediately saturates
+#   the server and can get the IP banned. With exponential backoff the first
+#   retry waits 1s, the second 2s, the third 4s — giving the server time to
+#   recover.
 # ---------------------------------------------------------------------------
 
-DEFAULT_TIMEOUT_SECONDS: int = 10
+# 30 s and not 10: Kalshi's /series endpoint returns ~16 MB.
+DEFAULT_TIMEOUT_SECONDS: int = 30
+
+# How often the status of tracked markets is re-queried.
+#
+# This loop did NOT exist: run()'s docstring promised a MARKET_REFRESH_INTERVAL
+# that was never defined anywhere. get_markets() ran once at startup and the
+# list froze, so nobody ever re-checked a market's `status` and
+# `resolved_value` was NEVER written. Consequence: however many days ingestion
+# ran, the resolved-market counter stayed at 0 — and with it the Brier
+# calibration that depends on those markets.
+MARKET_REFRESH_INTERVAL: int = 900
+
+# Minimum fraction of tracked markets that must still be open. Below it the
+# basket counts as exhausted and rediscovery is triggered. 0.5 avoids churning
+# on a single resolution while still reacting before there is nothing to measure.
+MIN_ALIVE_FRACTION: float = 0.5
 MAX_RETRIES: int = 3
-RETRY_BACKOFF_BASE: float = 1.0  # segundos, se dobla con cada retry
+RETRY_BACKOFF_BASE: float = 1.0  # seconds; doubles on each retry
 
 
 class BaseConnector(ABC):
     """
-    Clase base para todos los connectors del sistema.
+    Base class for every connector in the system.
 
-    Subclases deben implementar:
-      - get_markets()    → descubrir mercados activos
-      - get_snapshot()   → estado actual de un mercado
-      - subscribe()      → stream en tiempo real
-      - _build_headers() → autenticación específica de cada venue
+    Subclasses must implement:
+      - get_markets()    → discover active markets
+      - get_snapshot()   → current state of one market
+      - subscribe()      → real-time stream
+      - _build_headers() → venue-specific authentication
 
-    La clase base provee:
-      - _get()  → HTTP GET con retry y logging
-      - _post() → HTTP POST con retry y logging
-      - run()   → loop principal: descubrir → inicializar → suscribir
+    The base class provides:
+      - _get()  → HTTP GET with retry and logging
+      - _post() → HTTP POST with retry and logging
+      - run()   → main loop: discover → initialise → subscribe
     """
 
     def __init__(
@@ -82,157 +113,361 @@ class BaseConnector(ABC):
         on_tick: TickCallback,
         on_snapshot: SnapshotCallback,
         timeout: int = DEFAULT_TIMEOUT_SECONDS,
+        refresh_interval: int = MARKET_REFRESH_INTERVAL,
+        max_tau_days: float = 0.0,
+        require_two_sided_book: bool = False,
     ) -> None:
         """
         Args:
-            on_tick:     callback llamado por cada Tick del WebSocket
-            on_snapshot: callback llamado por cada MarketSnapshot
-            timeout:     timeout en segundos para requests HTTP
+            on_tick:      callback invoked for each Tick from the stream
+            on_snapshot:  callback invoked for each MarketSnapshot
+            timeout:      HTTP request timeout, in seconds
+            refresh_interval: how often, in seconds, the status of tracked
+                          markets is re-queried (this is what detects resolution)
+            max_tau_days: drop markets resolving beyond this horizon.
+                          0 disables the filter.
+            require_two_sided_book: drop markets without both a bid and an ask.
         """
         self._on_tick = on_tick
         self._on_snapshot = on_snapshot
         self._timeout = aiohttp.ClientTimeout(total=timeout)
         self._session: aiohttp.ClientSession | None = None
+        self._refresh_interval = refresh_interval
+        self._max_tau_days = max_tau_days
+        self._require_two_sided_book = require_two_sided_book
+        self._market_status: dict[str, MarketStatus] = {}
+
+        # Set when the basket of tracked markets has gone stale (too many
+        # resolved) and rediscovery is needed.
+        self._restart_stream: asyncio.Event = asyncio.Event()
 
     # ------------------------------------------------------------------
-    # Métodos abstractos — cada connector los implementa
+    # Quality filter — which markets are worth the storage
+    # ------------------------------------------------------------------
+
+    def is_worth_ingesting(self, market: Market) -> tuple[bool, str]:
+        """
+        Decide whether a market is worth admitting into the database.
+
+        Why filter at the SOURCE rather than afterwards:
+          A row once written already costs disk, index and query time. In the
+          development database, 31,000 of 31,100 ticks were historical backfill
+          from Manifold markets resolving between 117 days and 74 YEARS out: we
+          will never see their outcome, so they serve neither Brier nor signal
+          validation, and yet they dominated every aggregate.
+
+        Returns:
+            (accept, reason_for_rejection)
+        """
+        if market.status != MarketStatus.OPEN:
+            return False, "not_open"
+
+        if self._max_tau_days > 0:
+            tau_days = market.resolution.tau * 365.25
+            if tau_days > self._max_tau_days:
+                return False, f"tau_too_long ({tau_days:.0f}d > {self._max_tau_days:.0f}d)"
+            if tau_days <= 0:
+                return False, "already_expired"
+
+        return True, ""
+
+    # ------------------------------------------------------------------
+    # Abstract methods — implemented by each connector
     # ------------------------------------------------------------------
 
     @abstractmethod
     async def get_markets(self) -> list[Market]:
         """
-        Fetcha la lista de mercados activos desde la API REST.
+        Fetch the list of active markets from the REST API.
 
         Returns:
-            Lista de objetos Market del dominio canónico.
-            Lista vacía si no hay mercados o hay error.
+            List of canonical domain Market objects.
+            Empty list when there are no markets or on error.
         """
         ...
 
     @abstractmethod
     async def get_snapshot(self, market_id: str) -> MarketSnapshot | None:
         """
-        Fetcha el estado actual completo de un mercado.
+        Fetch the complete current state of one market.
 
         Args:
-            market_id: string canónico "venue:raw_id"
+            market_id: canonical "venue:raw_id" string
 
         Returns:
-            MarketSnapshot con market + orderbook + last_tick,
-            o None si el mercado no existe o hay error.
+            A MarketSnapshot with market + orderbook + last_tick, or
+            None when the market does not exist or on error.
         """
         ...
 
     @abstractmethod
     async def subscribe(self, market_ids: list[str]) -> None:
         """
-        Se suscribe al stream en tiempo real para los mercados dados.
+        Subscribe to the real-time stream for the given markets.
 
-        Por cada evento del WebSocket llama a:
+        For each WebSocket event it calls:
           self._on_tick(tick)           → trades y quote updates
           self._on_snapshot(snapshot)   → orderbook updates completos
 
-        Este método no retorna hasta que la conexión se cierra.
-        El loop de reconexión está en run().
+        This method does not return until the connection closes.
+        The reconnection loop lives in run().
 
         Args:
-            market_ids: lista de strings canónicos "venue:raw_id"
+            market_ids: list of canonical "venue:raw_id" strings
         """
         ...
 
     @abstractmethod
     def _build_headers(self) -> dict[str, str]:
         """
-        Construye los headers de autenticación para esta venue.
+        Build the authentication headers for this venue.
 
         Kalshi:     KALSHI-ACCESS-KEY + KALSHI-ACCESS-SIGNATURE (RSA)
-        Polymarket: sin auth para lectura
-        Manifold:   sin auth
+        Polymarket: no auth required for reads
+        Manifold:   no auth required
 
         Returns:
-            Dict de headers HTTP listos para incluir en cada request.
+            Dict of HTTP headers ready to attach to every request.
         """
         ...
 
+    async def fetch_market(self, market_id: str) -> Market | None:
+        """
+        Re-query the metadata of ONE already-known market.
+
+        Different from get_snapshot(): a resolved market has no book left, so
+        get_snapshot() returns None and the resolution would never be seen.
+        This asks only for metadata, which is what changes on resolution.
+
+        Default implementation: derive it from the snapshot. Each venue should
+        override this with its own metadata endpoint.
+        """
+        snapshot = await self.get_snapshot(market_id)
+        return snapshot.market if snapshot else None
+
+    async def _refresh_loop(self, market_ids: list[str], interval: int) -> None:
+        """
+        Periodically re-query the status of tracked markets and emit those that
+        changed, so the writer persists status and resolved_value.
+
+        This is the only path by which a resolution reaches the database.
+        """
+        while True:
+            await asyncio.sleep(interval)
+
+            changed = 0
+            for market_id in market_ids:
+                try:
+                    market = await self.fetch_market(market_id)
+                except Exception as e:
+                    log.debug("refresh failed for %s: %s", market_id, e)
+                    continue
+
+                if market is None:
+                    continue
+
+                previous = self._market_status.get(market_id)
+                if previous == market.status and not market.resolution.is_resolved():
+                    continue
+
+                self._market_status[market_id] = market.status
+                changed += 1
+                await self._on_snapshot(MarketSnapshot(market=market))
+
+                if market.resolution.is_resolved():
+                    log.info(
+                        "market_resolved: %s outcome=%s",
+                        market_id,
+                        market.resolution.resolved_value,
+                    )
+
+            if changed:
+                log.info(
+                    "%s: refreshed %d/%d markets with status changes",
+                    self.__class__.__name__,
+                    changed,
+                    len(market_ids),
+                )
+
+            # If most tracked markets are no longer tradeable, the basket is
+            # exhausted and rediscovery is needed.
+            #
+            # Without this the list stayed frozen from startup. It happened for
+            # real: Kalshi discovered 93 sports markets, all resolved within
+            # hours, and polling then spent 17 HOURS querying dead markets —
+            # producing no ticks and burning one request every 30 s — because
+            # _poll_rest() is a `while True` that never returns and rediscovery
+            # only happened when the stream ended.
+            alive = sum(
+                1
+                for mid in market_ids
+                if self._market_status.get(mid, MarketStatus.OPEN) == MarketStatus.OPEN
+            )
+            if alive < max(1, len(market_ids) * MIN_ALIVE_FRACTION):
+                log.info(
+                    "%s: only %d/%d markets still open — rediscovering",
+                    self.__class__.__name__,
+                    alive,
+                    len(market_ids),
+                )
+                self._restart_stream.set()
+                return
+
     # ------------------------------------------------------------------
-    # Loop principal — igual para todos los connectors
+    # Main loop — identical for every connector
     # ------------------------------------------------------------------
 
     async def run(self) -> None:
         """
-        Loop principal del connector:
-          1. Abrir sesión HTTP
-          2. Descubrir mercados activos
-          3. Obtener snapshot inicial de cada mercado
-          4. Suscribirse al stream WebSocket
-          5. Si cae la conexión → esperar y reconectar desde el paso 4
+        Connector main loop:
+          1. Open the HTTP session
+          2. Discover active markets
+          3. Take an initial snapshot of each market
+          4. Subscribe to the WebSocket stream
+          5. On disconnect → wait and reconnect from step 4
 
-        Por qué reconectar solo desde el paso 4 y no desde el 2:
-          Los mercados activos no cambian con cada reconexión.
-          Re-fetchar la lista entera en cada reconexión generaría
+        Why reconnect from step 4 and not from step 2:
+          The set of active markets does not change on every reconnect.
+          Re-fetching the whole list each time would generate needless load.
           carga innecesaria. Solo re-suscribimos el WebSocket.
-          La lista de mercados se refresca cada MARKET_REFRESH_INTERVAL.
+          The market list is refreshed every MARKET_REFRESH_INTERVAL.
         """
+        # The User-Agent goes first so a venue can override it if needed, while
+        # no venue ends up without one by omission.
+        session_headers = {"User-Agent": USER_AGENT, **self._build_headers()}
+
         async with aiohttp.ClientSession(
             timeout=self._timeout,
-            headers=self._build_headers(),
+            headers=session_headers,
         ) as session:
             self._session = session
 
             log.info("%s connector starting", self.__class__.__name__)
 
-            # Paso 1: descubrir mercados activos
+            # Outer loop: when the stream ends or there are no markets left to
+            # follow, rediscover rather than declaring the connector dead.
+            while True:
+                await self._discover_and_stream()
+
+    async def _discover_and_stream(self) -> None:
+        """One full round: discover, filter, initial snapshot and stream."""
+        # Step 1: discover active markets, retrying while there are none.
+        #
+        # This used to `return`, killing the connector for good. With the
+        # quality filter that goes from a rare case to a routine one: if no
+        # market on a venue passed the filter, the venue stayed disconnected
+        # for the rest of the run instead of looking again later.
+        self._restart_stream.clear()
+
+        markets: list[Market] = []
+        while not markets:
             markets = await self.get_markets()
             if not markets:
-                log.warning("%s: no active markets found", self.__class__.__name__)
-                return
+                log.warning(
+                    "%s: no active markets found — retrying in %ds",
+                    self.__class__.__name__,
+                    self._refresh_interval,
+                )
+                await asyncio.sleep(self._refresh_interval)
 
-            market_ids = [str(m.market_id) for m in markets]
-            log.info(
-                "%s: found %d active markets",
+        # Quality filter BEFORE touching the database: what fails here never
+        # costs a row.
+        kept: list[Market] = []
+        rejected: dict[str, int] = {}
+        for market in markets:
+            ok, reason = self.is_worth_ingesting(market)
+            if ok:
+                kept.append(market)
+            else:
+                key = reason.split(" ")[0]
+                rejected[key] = rejected.get(key, 0) + 1
+
+        market_ids = [str(m.market_id) for m in kept]
+        for market in kept:
+            self._market_status[str(market.market_id)] = market.status
+
+        log.info(
+            "%s: tracking %d markets (%d discarded: %s)",
+            self.__class__.__name__,
+            len(market_ids),
+            len(markets) - len(market_ids),
+            rejected or "none",
+        )
+
+        if not market_ids:
+            log.warning(
+                "%s: no markets passed the quality filter — retrying in %ds",
                 self.__class__.__name__,
-                len(markets),
+                self._refresh_interval,
             )
+            await asyncio.sleep(self._refresh_interval)
+            return
 
-            # Paso 2: snapshot inicial de cada mercado y backfill si aplica
-            for market_id in market_ids:
-                snapshot = await self.get_snapshot(market_id)
-                if snapshot is not None:
-                    await self._on_snapshot(snapshot)
-                    log.debug("Initial snapshot: %s", market_id)
-                    # Backfill si la venue lo soporta
-                    if hasattr(self, "backfill_market"):
-                        try:
-                            await self.backfill_market(market_id)
-                        except Exception as e:
-                            log.warning("Failed to backfill market %s: %s", market_id, e)
+        # Step 2: initial snapshot per market, plus backfill where supported
+        for market_id in market_ids:
+            snapshot = await self.get_snapshot(market_id)
+            if snapshot is not None:
+                await self._on_snapshot(snapshot)
+                log.debug("Initial snapshot: %s", market_id)
+                # Backfill where the venue supports it
+                if hasattr(self, "backfill_market"):
+                    try:
+                        await self.backfill_market(market_id)
+                    except Exception as e:
+                        log.warning("Failed to backfill market %s: %s", market_id, e)
 
-            # Paso 3: suscribirse con reconexión automática
-            retry = 0
-            while True:
-                try:
-                    log.info(
-                        "%s: subscribing to %d markets (attempt %d)",
-                        self.__class__.__name__,
-                        len(market_ids),
-                        retry + 1,
-                    )
-                    await self.subscribe(market_ids)
-                    # subscribe() retornó normalmente — fin del stream
-                    log.info("%s: stream ended normally", self.__class__.__name__)
-                    break
+        # Step 3: background metadata refresh loop.
+        # It runs alongside the stream: this is what detects resolutions.
+        refresh_task = asyncio.create_task(
+            self._refresh_loop(market_ids, self._refresh_interval),
+            name=f"{self.__class__.__name__}-refresh",
+        )
 
-                except Exception as e:
-                    retry += 1
-                    wait = RETRY_BACKOFF_BASE * (2 ** min(retry, 6))
-                    log.warning(
-                        "%s: stream error (attempt %d): %s — retrying in %.1fs",
-                        self.__class__.__name__,
-                        retry,
-                        e,
-                        wait,
-                    )
-                    await asyncio.sleep(wait)
+        # Step 4: subscribe, with automatic reconnection
+        retry = 0
+        while True:
+            try:
+                log.info(
+                    "%s: subscribing to %d markets (attempt %d)",
+                    self.__class__.__name__,
+                    len(market_ids),
+                    retry + 1,
+                )
+                # The stream races the rediscovery signal:
+                # whichever finishes first wins. Without this race, a stream
+                # that never returns (REST polling, a stable WebSocket) blocked
+                # market-list refresh forever.
+                stream_task = asyncio.create_task(self.subscribe(market_ids))
+                restart_task = asyncio.create_task(self._restart_stream.wait())
+
+                done, pending = await asyncio.wait(
+                    [stream_task, restart_task],
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for task in pending:
+                    task.cancel()
+                await asyncio.gather(*pending, return_exceptions=True)
+
+                if stream_task in done:
+                    error = stream_task.exception()
+                    if error is not None:
+                        raise error
+
+                log.info("%s: stream ended — rediscovering", self.__class__.__name__)
+                refresh_task.cancel()
+                break
+
+            except Exception as e:
+                retry += 1
+                wait = RETRY_BACKOFF_BASE * (2 ** min(retry, 6))
+                log.warning(
+                    "%s: stream error (attempt %d): %s — retrying in %.1fs",
+                    self.__class__.__name__,
+                    retry,
+                    e,
+                    wait,
+                )
+                await asyncio.sleep(wait)
 
     # ------------------------------------------------------------------
     # HTTP helpers — retry + logging compartidos
@@ -244,19 +479,19 @@ class BaseConnector(ABC):
         params: dict | None = None,
     ) -> dict | list | None:
         """
-        HTTP GET con retry exponencial.
+        HTTP GET with exponential retry.
 
-        Por qué devolver None en lugar de lanzar excepción:
-          Un error de red en un connector no debe derribar el sistema
-          entero. El caller decide si None es aceptable o si debe
-          reintentar. El logging aquí da visibilidad sin propagar el error.
+        Why None is returned rather than raising:
+          A network error in one connector must not bring the whole system
+          down. The caller decides whether None is acceptable or whether to
+          retry. Logging here gives visibility without propagating the error.
 
         Args:
-            url:    URL completa del endpoint
-            params: query params opcionales
+            url:    full endpoint URL
+            params: optional query params
 
         Returns:
-            JSON parseado como dict o list, None si todos los retries fallan.
+            Parsed JSON as a dict or list, None if every retry fails.
         """
         if self._session is None:
             log.error("_get called before session was opened")
@@ -268,14 +503,14 @@ class BaseConnector(ABC):
                     if resp.status == 200:
                         return await resp.json()
 
-                    # 429 = rate limit — esperar más
+                    # 429 = rate limit — wait longer
                     if resp.status == 429:
                         wait = RETRY_BACKOFF_BASE * (2**attempt) * 2
                         log.warning("Rate limited on GET %s — waiting %.1fs", url, wait)
                         await asyncio.sleep(wait)
                         continue
 
-                    # 4xx client errors — no tiene sentido reintentar
+                    # 4xx client errors — retrying makes no sense
                     if 400 <= resp.status < 500:
                         log.error("Client error %d on GET %s", resp.status, url)
                         return None
@@ -289,7 +524,12 @@ class BaseConnector(ABC):
                         MAX_RETRIES,
                     )
 
-            except aiohttp.ClientError as e:
+            # TimeoutError va aparte de ClientError: asyncio.TimeoutError NO hereda
+            # of aiohttp.ClientError, so without catching it a slow endpoint was
+            # not retried — it escaped _get(), propagated through
+            # asyncio.gather() and took down the WHOLE ingestion. That is what
+            # happened with Kalshi's /series endpoint: 16.6 MB, over a 10 s timeout.
+            except (aiohttp.ClientError, TimeoutError) as e:
                 log.warning(
                     "Network error on GET %s (attempt %d/%d): %s",
                     url,
@@ -311,8 +551,8 @@ class BaseConnector(ABC):
         body: dict,
     ) -> dict | None:
         """
-        HTTP POST con retry exponencial.
-        Misma lógica que _get — ver comentarios allí.
+        HTTP POST with exponential retry.
+        Same logic as _get — see the comments there.
         """
         if self._session is None:
             log.error("_post called before session was opened")
@@ -341,7 +581,7 @@ class BaseConnector(ABC):
                         MAX_RETRIES,
                     )
 
-            except aiohttp.ClientError as e:
+            except (aiohttp.ClientError, TimeoutError) as e:
                 log.warning(
                     "Network error on POST %s (attempt %d/%d): %s",
                     url,
@@ -357,7 +597,7 @@ class BaseConnector(ABC):
         return None
 
     # ------------------------------------------------------------------
-    # Context manager — para uso con async with
+    # Context manager — for use with `async with`
     # ------------------------------------------------------------------
 
     async def __aenter__(self) -> BaseConnector:

@@ -1,7 +1,7 @@
 """
 execution/risk/circuit_breaker.py
 ──────────────────────────────────
-Monitoreo de condiciones extremas y desactivación temporal del quoting (circuit breaker).
+Extreme-condition monitoring and temporary quoting shutdown (circuit breaker).
 """
 
 from __future__ import annotations
@@ -15,11 +15,11 @@ log = logging.getLogger(__name__)
 
 class CircuitBreaker:
     """
-    Controla el apagado de emergencia (halt) del quoting del sistema.
+    Controls the system's emergency quoting halt.
 
-    Condiciones de disparo:
-      1. Régimen de near-resolution crítico o resuelto (HALT o RESOLVED).
-      2. Superación del límite de pérdidas diarias acumuladas (max_daily_loss).
+    Trip conditions:
+      1. A critical or resolved near-resolution regime (HALT or RESOLVED).
+      2. Cumulative daily loss exceeding max_daily_loss.
     """
 
     def __init__(self, max_daily_loss: float) -> None:
@@ -29,33 +29,33 @@ class CircuitBreaker:
 
     @property
     def is_tripped(self) -> bool:
-        """Devuelve True si el circuit breaker está activado (sistema detenido)."""
+        """True when the breaker has tripped (system halted)."""
         return self._is_tripped
 
     @property
     def trip_reason(self) -> str:
-        """Motivo del último disparo."""
+        """Reason for the most recent trip."""
         return self._trip_reason
 
     def check(self, regime: NearResolutionRegime, daily_loss: float) -> bool:
         """
-        Evalúa el estado del mercado y las pérdidas y dispara el breaker si es necesario.
+        Evaluate market state and losses, tripping the breaker when needed.
 
         Args:
-            regime:     El NearResolutionRegime actual.
-            daily_loss: Pérdida acumulada en el día (número positivo para pérdidas).
+            regime:     the current NearResolutionRegime.
+            daily_loss: cumulative loss for the day (positive means a loss).
 
         Returns:
-            True si está disparado/activo (halt), False en caso contrario.
+            True when tripped (halted), False otherwise.
         """
-        # 1. Chequeo de régimen
+        # 1. Regime check
         if regime in (NearResolutionRegime.HALT, NearResolutionRegime.RESOLVED):
             self._is_tripped = True
             self._trip_reason = f"Regime near-resolution limit reached: {regime.value}"
             log.error(f"circuit_breaker_tripped: reason={self._trip_reason}")
             return True
 
-        # 2. Chequeo de pérdida diaria
+        # 2. Daily-loss check
         if daily_loss >= self.max_daily_loss:
             self._is_tripped = True
             self._trip_reason = (
@@ -67,7 +67,7 @@ class CircuitBreaker:
         return self._is_tripped
 
     def reset(self) -> None:
-        """Restablece el circuit breaker a su estado inicial operacional."""
+        """Restore the circuit breaker to its initial operating state."""
         if self._is_tripped:
             log.info("circuit_breaker_reset")
             self._is_tripped = False

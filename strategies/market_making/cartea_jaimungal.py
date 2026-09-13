@@ -1,45 +1,83 @@
 """
 strategies/market_making/cartea_jaimungal.py
 ─────────────────────────────────────────────
-Modelo Cartea-Jaimungal (CJ) en espacio logit — aproximación AS (§4.5 MATH.md v2.1).
+Cartea-Jaimungal quoter in logit space — AS approximation (MATH.md §4.5).
 
-Incorpora una señal direccional de corto plazo (drift latente mu_t) que sesga
-el precio de reserva.
+Adds a short-horizon directional signal (the latent drift mu_t) that skews the
+reservation price away from the mid.
 
-Relación con MATH.md v2.1:
-  §4.5 → precio de reserva con señal direccional
-  §5.4 → reservation price y spread en espacio logit
+Mapping to MATH.md v2.2:
+  §4.4 → ODEs for phi_1 and phi_2
+  §4.5 → reservation price with a directional signal
+  §5.4 → reservation price and spread in logit space
+  §6.4 → effective gamma under the near-resolution regimes
 """
 
 from __future__ import annotations
 
+import logging
 import math
 from datetime import UTC, datetime
 
-from features.resolution import TAU_1H, NearResolutionRegime
+from features.resolution import (
+    NearResolutionRegime,
+    effective_gamma_for_regime,
+)
+from normalizer.price_grid import PriceLadder, ladder_for_venue
 from normalizer.schema import MarketId
-from strategies.market_making.glft import TICK, Quote, logit, sigma
+from strategies.market_making.glft import (
+    MAX_HALF_SPREAD_X,
+    Quote,
+    apply_tick_floor,
+    logit,
+    sigma,
+)
+
+log = logging.getLogger(__name__)
+
+# Measure-change discount ρ_μ ∈ (0,1] — §4.4.
+# 0.5 means "trust half the signal". An honest placeholder: with no resolved
+# markets there is no way to calibrate what μ̂ is worth out of sample, and an
+# unvalidated signal does not deserve full confidence.
+DEFAULT_RHO_MU = 0.5
 
 
 class CarteaJaimungalQuoter:
     """
-    Quoter basado en el modelo de Cartea-Jaimungal en espacio logit.
+    Cartea-Jaimungal quoter in logit space.
 
-    Fórmulas (MATH.md v2.1 §4.5 & §5.4):
-      Varianza integrada:
-        σ̄²_b = σ²_b (constante)
+    Equations (MATH.md §4.5 and §5.4):
 
-      Fórmula de decaimiento temporal de la señal (phi_1):
-        φ_1(τ) = (ρ·σ_b·η / φ) · (1 - e^{-φ·τ})
+      Integrated variance:
+        σ̄²_b = σ²_b (constant under this approximation)
+
+      Alpha-capture factor (phi_1) — §4.4:
+        φ_1(τ) = ρ_μ · (1 − e^{−φτ}) / φ
+
+        This is precisely the accumulated drift one unit of inventory can still
+        capture over the remaining horizon:
+            (1/μ_t)·∫_t^T E[μ_s|μ_t] ds = ∫_0^τ e^{−φu} du = (1−e^{−φτ})/φ
+
+        v2.1 wrote φ_1 = (ρ·σ_b·η/φ)(1−e^{−φτ}), which is DIMENSIONALLY
+        IMPOSSIBLE: with [μ̂] = nats/year, φ_1·μ̂ must come out in nats, so
+        [φ_1] = years. But [ρ·σ_b·η/φ] = nats/year, making the product
+        nats²/year². The ρ·σ_b·η factor belongs to the q² term (the cross
+        variation d⟨S,μ⟩), not to the μq term, whose HJB coefficient is simply
+        1. η does NOT enter φ_1.
 
       Reservation log-odds:
-        r̃_X = X_t - q·γ_I·σ̄²_b·τ + φ_1(τ)·μ̂_t
+        r̃_X = X_t − q·γ_eff·σ̄²_b·τ + φ_1(τ)·μ̂_t
 
-      Optimal half-spread en logit (idéntico a GLFT):
-        δ*/2 = γ_I·σ̄²_b·τ/2 + (1/κ_x)·ln(1+γ_I/κ_x)
+        The sign of the signal term is POSITIVE: a positive expected drift means
+        the maker wants to accumulate long inventory, so it lifts both quotes.
+        This follows from r̃ = S + ∂_q g — the midpoint between ask = S + δ^a and
+        bid = S − δ^b, with δ^{a,b} = 1/κ ± ∂_q g from §4.3.
+
+      Optimal half-spread in logit space (identical to GLFT):
+        δ*/2 = γ_eff·σ̄²_b·τ/2 + (1/γ_eff)·ln(1 + γ_eff/κ_x)
 
       Quotes:
-        bid_p = σ(r̃_X - δ*/2)
+        bid_p = σ(r̃_X − δ*/2)
         ask_p = σ(r̃_X + δ*/2)
     """
 
@@ -54,10 +92,20 @@ class CarteaJaimungalQuoter:
         """
         Args:
             gamma_I: CARA inventory risk aversion.
-            kappa_x: fill curve decay en logit.
-            phi: mean-reversion speed del drift latente (phi > 0).
-            eta: volatilidad del drift latente (eta > 0).
-            rho: correlación entre innovaciones de precio y señal (rho ∈ [-0.99, 0.99]).
+            kappa_x: fill-curve decay in logit space.
+            phi: mean-reversion speed of the latent drift (phi > 0), in 1/year.
+                 A large phi means a signal that decays quickly.
+            eta: volatility of the latent drift (eta > 0), in nats/year^{3/2}.
+                 It does NOT enter phi_1 (see §4.4). It is retained because it
+                 is part of the OU model calibrated by CJCalibrator and because
+                 it prices the option to trade on future alpha, which lives in
+                 phi_0 and does not affect the quotes. Reported as a diagnostic.
+            rho: measure-change discount rho_mu ∈ (0, 1]. The signal is
+                 estimated under P while the quotes live under Q; rho_mu shrinks
+                 confidence in mu_hat, with 1 meaning "trust the signal fully".
+                 Through v2.1 this parameter was used as if it were the
+                 price-signal correlation inside phi_1, which not only broke the
+                 units but permitted negative values that inverted the signal.
         """
         if gamma_I <= 0:
             raise ValueError(f"gamma_I must be positive, got {gamma_I}")
@@ -67,8 +115,8 @@ class CarteaJaimungalQuoter:
             raise ValueError(f"phi must be positive, got {phi}")
         if eta <= 0:
             raise ValueError(f"eta must be positive, got {eta}")
-        if not (-0.999 <= rho <= 0.999):
-            raise ValueError(f"rho must be in [-0.99, 0.99], got {rho}")
+        if not (0.0 < rho <= 1.0):
+            raise ValueError(f"rho (rho_mu, measure-change discount) must be in (0, 1], got {rho}")
 
         self.gamma_I = gamma_I
         self.kappa_x = kappa_x
@@ -86,13 +134,15 @@ class CarteaJaimungalQuoter:
         regime: NearResolutionRegime,
         mu_hat: float = 0.0,
         timestamp: datetime | None = None,
+        ladder: PriceLadder | None = None,
     ) -> Quote:
         """
-        Calcula quotes de Cartea-Jaimungal incorporando la señal mu_hat.
+        Compute Cartea-Jaimungal quotes, incorporating the mu_hat signal.
         """
         ts = timestamp or datetime.now(tz=UTC)
+        grid = ladder if ladder is not None else ladder_for_venue(market_id.venue)
 
-        # Halt inmediato si el régimen lo requiere
+        # Immediate halt when the regime demands it
         if regime in (NearResolutionRegime.HALT, NearResolutionRegime.RESOLVED):
             return self._invalid_quote(
                 market_id=market_id,
@@ -105,47 +155,89 @@ class CarteaJaimungalQuoter:
                 reason=f"regime={regime.value}",
             )
 
-        # Estado en espacio logit
+        # State in logit space
         X_t = logit(mid_p)
 
-        # Varianza integrada
+        # Integrated variance
         sigma_bar_sq = belief_vol**2 * tau_years
 
-        # Signal skew: φ_1(τ) · μ̂_t
-        # φ_1(τ) = (ρ · σ_b · η / φ) · (1 - e^{-φ·τ})
-        # Si tau_years es muy pequeño o cero, phi_1(tau) -> 0
+        # Effective risk aversion under the near-resolution regime (§6.4)
+        gamma_eff = effective_gamma_for_regime(self.gamma_I, regime)
+
+        # Signal skew: φ_1(τ)·μ̂_t, with φ_1(τ) = ρ_μ·(1 − e^{−φτ})/φ  (§4.4)
+        # τ → 0 ⟹ φ_1 → 0: no horizon left over which to capture the drift.
         if tau_years > 0:
-            phi_1 = (self.rho * belief_vol * self.eta / self.phi) * (
-                1.0 - math.exp(-self.phi * tau_years)
-            )
+            phi_1 = (self.rho / self.phi) * (-math.expm1(-self.phi * tau_years))
             signal_skew = phi_1 * mu_hat
         else:
+            phi_1 = 0.0
             signal_skew = 0.0
 
-        # Reservation log-odds
-        reservation_X = X_t - inventory * self.gamma_I * sigma_bar_sq + signal_skew
+        # Reservation log-odds (§4.5): r̃ = S + ∂_q g = X - q·γ_eff·σ̄² + φ_1·μ̂
+        reservation_X = X_t - inventory * gamma_eff * sigma_bar_sq + signal_skew
 
-        # Optimal half-spread en logit (igual que GLFT)
-        inventory_term = self.gamma_I * sigma_bar_sq / 2.0
-        rent_term = (1.0 / self.kappa_x) * math.log(1.0 + self.gamma_I / self.kappa_x)
+        # Optimal half-spread in logit — exact first-order condition (§2.4),
+        # identical to GLFT
+        inventory_term = gamma_eff * sigma_bar_sq / 2.0
+        rent_term = (1.0 / gamma_eff) * math.log1p(gamma_eff / self.kappa_x)
         half_spread_X = inventory_term + rent_term
 
-        # Quotes en logit
+        # Sanity bound — see GLFTQuoter.quote
+        half_spread_clamped = False
+        if not math.isfinite(half_spread_X) or half_spread_X > MAX_HALF_SPREAD_X:
+            log.warning(
+                "half_spread_clamped: market=%s raw=%.4g max=%.2f "
+                "belief_vol=%.4g tau_years=%.4g gamma_eff=%.4g kappa_x=%.4g",
+                market_id,
+                half_spread_X,
+                MAX_HALF_SPREAD_X,
+                belief_vol,
+                tau_years,
+                gamma_eff,
+                self.kappa_x,
+            )
+            half_spread_X = MAX_HALF_SPREAD_X
+            half_spread_clamped = True
+
+        # Quotes in logit space
         bid_X = reservation_X - half_spread_X
         ask_X = reservation_X + half_spread_X
 
-        # Mapear a espacio precio
+        # Map back to price space
         bid_p_raw = sigma(bid_X)
         ask_p_raw = sigma(ask_X)
 
         # Aplicar tick floor
-        bid_p, ask_p, is_valid, reason = self._apply_tick_floor(
+        bid_p, ask_p, is_valid, reason = apply_tick_floor(
             bid_p=bid_p_raw,
             ask_p=ask_p_raw,
             reservation_X=reservation_X,
             tau_years=tau_years,
-            regime=regime,
+            ladder=grid,
         )
+
+        # The same two guards as GLFT — see GLFTQuoter.quote for the reasoning.
+        reservation_p = sigma(reservation_X)
+        if not (bid_p <= reservation_p <= ask_p):
+            log.warning(
+                "quote_does_not_straddle_reservation: market=%s r=%.4f bid=%.4f ask=%.4f",
+                market_id,
+                reservation_p,
+                bid_p,
+                ask_p,
+            )
+            is_valid = False
+            reason = (
+                f"quote_does_not_straddle_reservation: r={reservation_p:.4f} "
+                f"bid={bid_p:.4f} ask={ask_p:.4f}"
+            )
+
+        if half_spread_clamped:
+            is_valid = False
+            reason = (
+                f"half_spread_clamped: belief_vol={belief_vol:.4g} "
+                f"tau_years={tau_years:.4g} kappa_x={self.kappa_x:.4g}"
+            )
 
         return Quote(
             market_id=market_id,
@@ -170,44 +262,6 @@ class CarteaJaimungalQuoter:
             is_valid=is_valid,
             invalid_reason=reason,
         )
-
-    def _apply_tick_floor(
-        self,
-        bid_p: float,
-        ask_p: float,
-        reservation_X: float,
-        tau_years: float,
-        regime: NearResolutionRegime,
-    ) -> tuple[float, float, bool, str]:
-        """
-        Aplica el tick floor. Lógica heredada de GLFT.
-        """
-        bid_below = bid_p < TICK
-        ask_above = ask_p > 1.0 - TICK
-
-        if not bid_below and not ask_above:
-            return bid_p, ask_p, True, ""
-
-        if tau_years < TAU_1H:
-            return (
-                bid_p,
-                ask_p,
-                False,
-                (
-                    f"tick_floor_near_resolution: "
-                    f"bid={bid_p:.4f} ask={ask_p:.4f} tau_hours={tau_years*8760:.1f}"
-                ),
-            )
-
-        reservation_p = sigma(reservation_X)
-        bid_p_adj = max(TICK, reservation_p - TICK / 2.0)
-        ask_p_adj = min(1.0 - TICK, reservation_p + TICK / 2.0)
-
-        if bid_p_adj >= ask_p_adj:
-            bid_p_adj = TICK
-            ask_p_adj = 2 * TICK
-
-        return bid_p_adj, ask_p_adj, True, "tick_floor_adjusted"
 
     def _invalid_quote(
         self,

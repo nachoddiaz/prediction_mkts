@@ -1,7 +1,7 @@
 """
 tests/unit/test_paper_account.py
 ─────────────────────────────────
-Tests unitarios para la cuenta simulada (PaperAccount).
+Unit tests for the simulated account (PaperAccount).
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ def account() -> PaperAccount:
 
 
 def test_initial_state(account):
-    """Verifica que el estado inicial de la cuenta sea correcto."""
+    """The account's initial state is correct."""
     assert account.cash_balance == 10000.0
     assert len(account.positions) == 0
     assert len(account.orders) == 0
@@ -32,7 +32,7 @@ def test_initial_state(account):
 
 
 def test_create_order(account, market_id):
-    """Verifica la creación correcta de órdenes en estado PENDING."""
+    """Orders are created in PENDING state."""
     order = account.create_order(
         market_id=market_id,
         action=OrderAction.BUY,
@@ -50,13 +50,13 @@ def test_create_order(account, market_id):
     assert order.status == OrderStatus.PENDING
     assert order.is_active is True
 
-    # Comprobar que está en el registro de órdenes
+    # Confirm it is in the order registry
     assert order.order_id in account.orders
     assert len(account.get_active_orders(market_id)) == 1
 
 
 def test_cancel_order(account, market_id):
-    """Verifica la cancelación de órdenes activas."""
+    """Resting orders can be cancelled."""
     order = account.create_order(
         market_id=market_id,
         action=OrderAction.BUY,
@@ -64,23 +64,23 @@ def test_cancel_order(account, market_id):
         size=Size(10.0),
     )
 
-    # Confirmar orden (poner en ACTIVE)
+    # Confirm the order (move it to ACTIVE)
     order.status = OrderStatus.ACTIVE
 
-    # Cancelar la orden
+    # Cancel the order
     success = account.cancel_order(order.order_id)
     assert success is True
     assert order.status == OrderStatus.CANCELLED
     assert order.is_active is False
     assert len(account.get_active_orders(market_id)) == 0
 
-    # Re-cancelar debe fallar
+    # Cancelling again must fail
     success_retry = account.cancel_order(order.order_id)
     assert success_retry is False
 
 
 def test_fill_buy_order_total(account, market_id):
-    """Verifica un fill completo de una orden de COMPRA."""
+    """A BUY order fills completely."""
     order = account.create_order(
         market_id=market_id,
         action=OrderAction.BUY,
@@ -97,14 +97,14 @@ def test_fill_buy_order_total(account, market_id):
     assert filled_o.filled_size == 10.0
     assert filled_o.remaining_size == 0.0
 
-    # Balance de caja: 10000 - 4.00 = 9996.00
+    # Cash balance: 10000 - 4.00 = 9996.00
     assert account.cash_balance == 9996.0
-    # Posición de YES: +10.0
+    # YES position: +10.0
     assert account.get_position(market_id) == 10.0
 
 
 def test_fill_sell_order_partial(account, market_id):
-    """Verifica fills parciales de una orden de VENTA."""
+    """A SELL order fills partially."""
     order = account.create_order(
         market_id=market_id,
         action=OrderAction.SELL,
@@ -123,7 +123,7 @@ def test_fill_sell_order_partial(account, market_id):
     assert account.cash_balance == 10001.8
     assert account.get_position(market_id) == -3.0
 
-    # Segundo fill parcial (7 contratos excedentes de los restantes)
+    # Second partial fill (7 contracts in excess of those remaining)
     partial_o_2 = account.fill_order(order.order_id, Size(10.0), Price(0.60))
 
     assert partial_o_2 is not None

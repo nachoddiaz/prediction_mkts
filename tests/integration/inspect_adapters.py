@@ -1,14 +1,13 @@
 """
 tests/integration/inspect_adapters.py
 ────────────────────────────────────────
-Script de integración manual — hace peticiones HTTP reales a Kalshi
-y Polymarket, imprime los campos más relevantes del JSON crudo y
-el resultado tras la normalización.
+Manual integration script — it makes real HTTP requests to Kalshi,
+Polymarket and Manifold, and prints the result after normalisation.
 
-NO es un test pytest — no tiene asserts. Es para verificar visualmente
-que los adapters transforman correctamente los datos reales de la API.
+NOT a pytest test — it has no assertions. It exists to visually verify that
+the adapters transform real API data correctly.
 
-Uso (desde la raíz del proyecto):
+Usage (from the repository root):
     uv run python tests/integration/inspect_adapters.py
 """
 
@@ -109,8 +108,8 @@ def fetch(url: str, timeout: int = 10) -> dict | list | None:
 
 # ---------------------------------------------------------------------------
 # KALSHI
-# Buscamos mercados con más tiempo hasta resolución para tener liquidez.
-# Usamos el endpoint general sin filtro de serie para coger los más líquidos.
+# We look for markets further from resolution, since they carry liquidity.
+# The general endpoint is used without a series filter, to get the most liquid.
 # ---------------------------------------------------------------------------
 
 KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
@@ -118,19 +117,19 @@ KALSHI_BASE = "https://api.elections.kalshi.com/trade-api/v2"
 
 def inspect_kalshi_markets(n: int = 3) -> list[str]:
     """
-    Fetcha mercados de Kalshi con liquidez real.
-    Evita los mercados de BTC intraday que cierran en minutos y no tienen órdenes.
-    Devuelve los tickers para el inspect de orderbooks.
+    Fetch Kalshi markets that have real liquidity.
+    Avoids intraday BTC markets that close in minutes and carry no orders.
+    Returns the tickers for the order book inspection.
     """
     header("KALSHI — MARKETS")
 
-    # Buscamos mercados con volumen — sin filtro de serie para coger los más líquidos
+    # Look for markets with volume — no series filter, to get the most liquid
     url = f"{KALSHI_BASE}/events?limit={n}&status=open&with_nested_markets=true"
     print(f"\n  {DIM}GET {url}{RESET}\n")
 
     data = fetch(url)
     if not data:
-        # Fallback: endpoint directo de markets sin filtro de serie
+        # Fallback: the direct markets endpoint, with no series filter
         url = f"{KALSHI_BASE}/markets?limit={n}&status=open"
         print(f"  Fallback → {DIM}GET {url}{RESET}\n")
         data = fetch(url)
@@ -138,7 +137,7 @@ def inspect_kalshi_markets(n: int = 3) -> list[str]:
             return []
         markets_raw = data.get("markets", [])
     else:
-        # Extraer markets de los events
+        # Extract the markets out of the events
         markets_raw = []
         for event in data.get("events", []):
             markets_raw.extend(event.get("markets", []))
@@ -150,7 +149,7 @@ def inspect_kalshi_markets(n: int = 3) -> list[str]:
         section(f"Market {i}/{len(markets_raw)}")
 
         # --- RAW ---
-        print(f"\n  {DIM}── RAW (campos relevantes) ──{RESET}")
+        print(f"\n  {DIM}── RAW (relevant fields) ──{RESET}")
         raw_field("ticker", raw.get("ticker"))
         raw_field("title", raw.get("title"))
         raw_field("status", raw.get("status"))
@@ -160,7 +159,7 @@ def inspect_kalshi_markets(n: int = 3) -> list[str]:
         raw_field("volume_fp", raw.get("volume_fp"))
         raw_field("open_interest_fp", raw.get("open_interest_fp"))
         raw_field("series_ticker", raw.get("series_ticker") or "(no field)")
-        raw_field("result", raw.get("result") or "(vacío)")
+        raw_field("result", raw.get("result") or "(empty)")
 
         # --- NORMALIZADO ---
         try:
@@ -173,14 +172,14 @@ def inspect_kalshi_markets(n: int = 3) -> list[str]:
             norm_field(
                 "resolution_date", market.resolution.resolution_date.strftime("%Y-%m-%d %H:%M UTC")
             )
-            norm_field("tau (años)", f"{market.resolution.tau:.4f}", highlight=True)
-            norm_field("tau (días)", f"{market.resolution.tau * 365.25:.1f}")
+            norm_field("tau (years)", f"{market.resolution.tau:.4f}", highlight=True)
+            norm_field("tau (days)", f"{market.resolution.tau * 365.25:.1f}")
             norm_field("is_resolved", market.resolution.is_resolved())
             norm_field("resolved_value", market.resolution.resolved_value)
             norm_field("is_tradeable", market.is_tradeable())
             tickers.append(raw["ticker"])
         except Exception as e:
-            error(f"Error en normalización: {e}")
+            error(f"Normalisation error: {e}")
 
         divider()
 
@@ -206,15 +205,15 @@ def inspect_kalshi_orderbooks(tickers: list[str]) -> None:
 
         # --- RAW ---
         print(f"\n  {DIM}── RAW ──{RESET}")
-        raw_field("yes (top 3 bids)", raw_yes[:3] if raw_yes else "(vacío)")
-        raw_field("no  (top 3 asks)", raw_no[:3] if raw_no else "(vacío)")
+        raw_field("yes (top 3 bids)", raw_yes[:3] if raw_yes else "(empty)")
+        raw_field("no  (top 3 asks)", raw_no[:3] if raw_no else "(empty)")
         raw_field("total yes levels", len(raw_yes))
         raw_field("total no  levels", len(raw_no))
 
         if not raw_yes and not raw_no:
             warn(
-                "Libro vacío — mercado sin liquidez "
-                "(típico en mercados intraday cercanos al cierre o nuevos)"
+                "Empty book — market with no liquidity "
+                "(typical of intraday markets near expiry, or brand-new ones)"
             )
             divider()
             continue
@@ -260,7 +259,7 @@ def inspect_kalshi_orderbooks(tickers: list[str]) -> None:
                 warn("Libro incompleto — no se generó QUOTE tick")
 
         except Exception as e:
-            error(f"Error en normalización: {e}")
+            error(f"Normalisation error: {e}")
 
         divider()
 
@@ -275,11 +274,11 @@ CLOB_BASE = "https://clob.polymarket.com"
 
 def _get_tags(raw: dict) -> list[str]:
     """
-    Extrae tags del market. La API a veces devuelve tags: []
-    pero los tags reales están en events[0].tags o en el campo
-    de categoría del evento.
+    Extract tags from the market. The API sometimes returns tags: []
+    while the real tags live in events[0].tags or in the event's
+    category field.
     """
-    # Intento 1: campo tags directo
+    # Attempt 1: the tags field directly
     tags = raw.get("tags", [])
     if tags:
         return tags
@@ -291,7 +290,7 @@ def _get_tags(raw: dict) -> list[str]:
         if event_tags:
             return event_tags
 
-    # Intento 3: inferir de la question manualmente
+    # Attempt 3: infer it from the question by hand
     question = raw.get("question", "").lower()
     if any(w in question for w in ["bitcoin", "btc", "eth", "crypto", "sol"]):
         return ["crypto"]
@@ -319,11 +318,11 @@ def inspect_polymarket_markets(n: int = 3) -> list[str]:
     for i, raw in enumerate(markets_raw, 1):
         section(f"Market {i}/{len(markets_raw)}")
 
-        # Enriquecer con tags inferidos si vienen vacíos
+        # Enrich with inferred tags where they arrive empty
         inferred_tags = _get_tags(raw)
 
         # --- RAW ---
-        print(f"\n  {DIM}── RAW (campos relevantes) ──{RESET}")
+        print(f"\n  {DIM}── RAW (relevant fields) ──{RESET}")
         raw_field("conditionId", raw.get("conditionId"))
         raw_field("question", raw.get("question", "")[:55])
         raw_field("active", raw.get("active"))
@@ -337,7 +336,7 @@ def inspect_polymarket_markets(n: int = 3) -> list[str]:
         clob_raw = str(raw.get("clobTokenIds", ""))
         raw_field("clobTokenIds", clob_raw[:60] + "...")
 
-        # Inyectar tags inferidos para que el adapter los use
+        # Inject the inferred tags so the adapter uses them
         raw_enriched = {**raw, "tags": inferred_tags}
 
         # --- NORMALIZADO ---
@@ -351,8 +350,8 @@ def inspect_polymarket_markets(n: int = 3) -> list[str]:
             norm_field(
                 "resolution_date", market.resolution.resolution_date.strftime("%Y-%m-%d %H:%M UTC")
             )
-            norm_field("tau (años)", f"{market.resolution.tau:.4f}", highlight=True)
-            norm_field("tau (días)", f"{market.resolution.tau * 365.25:.1f}")
+            norm_field("tau (years)", f"{market.resolution.tau:.4f}", highlight=True)
+            norm_field("tau (days)", f"{market.resolution.tau * 365.25:.1f}")
             norm_field("is_resolved", market.resolution.is_resolved())
             norm_field("resolved_value", market.resolution.resolved_value)
             norm_field("is_tradeable", market.is_tradeable())
@@ -367,7 +366,7 @@ def inspect_polymarket_markets(n: int = 3) -> list[str]:
                 warn("No se pudieron extraer token IDs")
 
         except Exception as e:
-            error(f"Error en normalización: {e}")
+            error(f"Normalisation error: {e}")
 
         divider()
 
@@ -376,12 +375,12 @@ def inspect_polymarket_markets(n: int = 3) -> list[str]:
 
 def inspect_polymarket_orderbooks(yes_token_ids: list[str]) -> None:
     """
-    El endpoint /book del CLOB requiere auth.
-    Usamos los tres endpoints públicos: /midpoint, /price?side=BUY, /price?side=SELL.
+    The CLOB /book endpoint requires auth.
+    We use the three public endpoints: /midpoint, /price?side=BUY, /price?side=SELL.
 
-    Convención de Polymarket:
-      /price?side=BUY  → precio mínimo al que alguien vende YES = BEST ASK
-      /price?side=SELL → precio máximo al que alguien compra YES = BEST BID
+    Polymarket convention:
+      /price?side=BUY  → lowest price anyone sells YES at = BEST ASK
+      /price?side=SELL → highest price anyone buys YES at  = BEST BID
     """
     header("POLYMARKET — ORDERBOOKS  (CLOB API — endpoints públicos)")
 
@@ -402,15 +401,15 @@ def inspect_polymarket_orderbooks(yes_token_ids: list[str]) -> None:
         sell_data = fetch(url_sell)
 
         if not (mid_data and buy_data and sell_data):
-            warn("No se pudo obtener datos del CLOB")
+            warn("Could not fetch CLOB data")
             divider()
             continue
 
-        # Convención CLOB de Polymarket:
-        #   BUY  price = precio al que puedes comprar YES ahora = BEST ASK
-        #   SELL price = precio al que puedes vender YES ahora  = BEST BID
-        best_ask = float(buy_data["price"])  # lo que pagas para comprar YES
-        best_bid = float(sell_data["price"])  # lo que recibes al vender YES
+        # Polymarket CLOB convention:
+        #   BUY  price = the price you can buy YES at now  = BEST ASK
+        #   SELL price = the price you can sell YES at now = BEST BID
+        best_ask = float(buy_data["price"])  # what you pay to buy YES
+        best_bid = float(sell_data["price"])  # what you receive for selling YES
         mid = float(mid_data["mid"])
 
         # --- RAW ---
@@ -426,12 +425,12 @@ def inspect_polymarket_orderbooks(yes_token_ids: list[str]) -> None:
 
         try:
             if best_bid >= best_ask:
-                # Puede ocurrir en mercados muy líquidos donde bid≈ask≈1
-                # o cuando la API devuelve temporalmente precios inconsistentes
+                # Can happen in very liquid markets where bid≈ask≈1, or when
+                # the API momentarily returns inconsistent prices
                 warn(f"bid ({best_bid}) >= ask ({best_ask}) — mercado en equilibrio extremo")
-                warn("Ajustando spread mínimo para construir el OrderBook")
-                # En este caso bid y ask son prácticamente iguales
-                # Usamos el mid como referencia con spread mínimo
+                warn("Widening to a minimal spread so the OrderBook can be built")
+                # Here bid and ask are practically equal, so we use the mid as
+                # the reference with a minimal spread
                 best_bid = mid - 0.001
                 best_ask = mid + 0.001
 
@@ -450,7 +449,7 @@ def inspect_polymarket_orderbooks(yes_token_ids: list[str]) -> None:
             norm_field("spread", f"{ob.spread:.4f}")
             norm_field("bid levels", len(ob.bids))
             norm_field("ask levels", len(ob.asks))
-            print(f"  {DIM}  (profundidad y tamaños no disponibles sin auth en /book){RESET}")
+            print(f"  {DIM}  (depth and sizes unavailable without auth on /book){RESET}")
 
             if tick:
                 print(f"\n  {DIM}── QUOTE TICK derivado ──{RESET}")
@@ -484,7 +483,7 @@ def main() -> None:
     inspect_polymarket_orderbooks(yes_token_ids)
 
     print(f"\n{BOLD}{GREEN}{'═' * 60}{RESET}")
-    print(f"{BOLD}{GREEN}  Inspección completada{RESET}")
+    print(f"{BOLD}{GREEN}  Inspection complete{RESET}")
     print(f"{BOLD}{GREEN}{'═' * 60}{RESET}\n")
 
 

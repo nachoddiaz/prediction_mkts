@@ -8,6 +8,28 @@
 
 ---
 
+> **v2.2 corrections (this revision).** Seven defects found by dimensional and
+> sign analysis of v2.1, all now fixed in doc *and* code:
+> - **(U)** Notation table gave $\tau$, $\sigma_b$, $\phi$, $A$ in *seconds*; every
+>   operative formula and all code use **years**. Units table corrected.
+> - **(S1)** §4.4 integrated $\dot\phi_2$ forward instead of backward from
+>   $\phi_2(T)=0$, giving $\phi_2=+\gamma\sigma^2\tau/2$ instead of $-\gamma\sigma^2\tau/2$.
+> - **(S2)** §4.5 wrote $\tilde p = S - \partial_q g$; §4.3 implies $\tilde p = S + \partial_q g$.
+>   (S1) and (S2) cancelled in the inventory term and left the *signal* term inverted.
+>   The code was right; the document was wrong.
+> - **(D)** §4.4's $\phi_1=(\rho\sigma\eta/\phi)(1-e^{-\phi\tau})$ is dimensionally
+>   inconsistent — it makes $\phi_1\hat\mu$ come out in nats²/year² instead of nats.
+>   The correct alpha-capture factor is $\phi_1=\rho_\mu(1-e^{-\phi\tau})/\phi$.
+> - **(R)** §5.4 eq (2.2) used the A-S approximation $\frac{1}{\kappa}\ln(1+\gamma/\kappa)$
+>   that §2.4 explicitly rejects. Unified on the exact $\frac{1}{\gamma}\ln(1+\gamma/\kappa)$.
+> - **(N)** §5.3's realised-QV estimator was applied tick-by-tick, so it inherited
+>   the microstructure-noise divergence of realised variance as $\Delta t\to0$.
+>   Now estimated on a fixed 60 s grid, winsorised, and bounded.
+> - **(T)** §5.4 eq (2.3) hard-coded a \$0.01 tick. Both venues quote finer;
+>   the tick is now a per-market price ladder read from venue metadata.
+
+---
+
 ## Notation Reference
 
 > **v2.1 corrections**: `σ_b` replaces `σ_B`; `γ_I` / `φ_K` replace single `γ`;
@@ -21,23 +43,23 @@
 | $\sigma'(x) = p(1-p)$ | First derivative of inverse logit | — |
 | $\sigma''(x) = p(1-p)(1-2p)$ | Second derivative | — |
 | $T$ | Resolution time (fixed) | — |
-| $\tau = T - t$ | Time remaining to resolution | seconds |
+| $\tau = T - t$ | Time remaining to resolution | **years** |
 | $q_t \in \mathbb{Z}$ | Inventory in contracts (signed) | shares |
 | $Q$ | Maximum inventory limit $\vert q \vert \leq Q$ | shares |
-| $\sigma_b(t, X)$ | Belief volatility (instantaneous, of log-odds) | $1/\sqrt{s}$ |
+| $\sigma_b(t, X)$ | Belief volatility (instantaneous, of log-odds) | $1/\sqrt{\text{year}}$ |
 | $\gamma_I$ | CARA inventory risk aversion | $1/\$$ |
 | $\varphi_K \in (0,1]$ | Kelly fractional multiplier | dimensionless |
 | $\kappa_x,\, \kappa_p$ | Fill-curve decay in logit / price space | dimensionless, $1/\$$ |
-| $A$ | Fill arrival rate at zero spread | $1/s$ |
+| $A$ | Fill arrival rate at zero spread | $1/\text{year}$ |
 | $\varepsilon = p^{\mathbb{P}} - p^{\text{mkt}}$ | Edge (model minus market) | dimensionless |
 | $\delta^b, \delta^a$ | Bid and ask half-spreads | — |
-| $\lambda^b(\delta), \lambda^a(\delta)$ | Arrival intensities of market orders | $1/s$ |
+| $\lambda^b(\delta), \lambda^a(\delta)$ | Arrival intensities of market orders | $1/\text{year}$ |
 | $W_t$ | $\mathbb{Q}$-Brownian motion (log-odds noise) | — |
 | $B_t$ | $\mathbb{P}$-Brownian motion (signal noise) | — |
-| $\mu_t$ | Latent alpha-drift under $\mathbb{P}$ (OU) | — |
-| $\hat{\mu}_t$ | Estimated signal: $\sum_k w_k s_{k,t}$ | — |
-| $\phi$ | Mean-reversion speed of $\mu_t$ | $1/s$ |
-| $\eta$ | Volatility of $\mu_t$ | — |
+| $\mu_t$ | Latent alpha-drift of $X_t$ under $\mathbb{P}$ (OU) | nats/year |
+| $\hat{\mu}_t$ | Estimated drift: $\sum_k w_k s_{k,t}$ (the $w_k$ carry the units) | nats/year |
+| $\phi$ | Mean-reversion speed of $\mu_t$ | $1/\text{year}$ |
+| $\eta$ | Volatility of $\mu_t$ | nats/year$^{3/2}$ |
 | $\rho_\mu \in (0,1]$ | Measure-change discount on alpha | dimensionless |
 | $\rho$ | Correlation $d\langle W,B\rangle_t = \rho\,dt$ | dimensionless |
 | $r$ | Oracle reversal probability | dimensionless |
@@ -237,8 +259,18 @@ $\delta^{a*}\neq\delta^{b*}$ when $q\neq 0$, which A-S cannot.
 
 Calibrate $\kappa$ and $A$ per market by MLE over observed fill rates:
 
-$$\hat\kappa,\hat A = \arg\max\sum_i\ln\lambda(\delta_i;A,\kappa)
-= \arg\max\sum_i[\ln A-\kappa\delta_i]$$
+$$\hat\kappa,\hat A = \arg\max\sum_i\Bigl[f_i\ln\lambda(\delta_i;A,\kappa)
+-\lambda(\delta_i;A,\kappa)\,\Delta t_i\Bigr]
+= \arg\max\sum_i\Bigl[f_i(\ln A-\kappa\delta_i)-Ae^{-\kappa\delta_i}\Delta t_i\Bigr]$$
+
+where $f_i\in\{0,1\}$ indicates a fill in window $i$. **The $-\lambda\Delta t$ term is
+not optional:** without it the objective is monotone increasing in $A$ and the
+MLE is unbounded. (v2.1 omitted it; the implementation always had it.)
+
+**Identifiability.** The estimator needs variation in $\delta_i$ *and* $\sum_i f_i>0$.
+A venue that reports a constant synthetic spread — Manifold — satisfies neither, and
+the optimiser lands on the box boundary. `GLFTCalibrator` now refuses to return a
+result in that case rather than reporting the bound as a fit.
 
 Run per category (crypto vs political markets have different $\kappa$) and
 recalibrate with each new batch of ticks.
@@ -297,41 +329,101 @@ Propose $g(t,q,\mu)=\phi_0(t)+\phi_1(t)\mu q+\phi_2(t)q^2$:
 - $\phi_1(t)\mu q$: signal-inventory interaction — all directionality lives here
 - $\phi_2(t)q^2$: quadratic inventory penalty
 
-$\partial_q g=\phi_1(t)\mu+2\phi_2(t)q$, $\partial_\mu g=\phi_1(t)q$
+$\partial_q g=\phi_1(t)\mu+2\phi_2(t)q$, $\partial_\mu g=\phi_1(t)q$,
+$\partial_{\mu\mu}g=0$ (g is linear in $\mu$).
 
-Substituting and separating by powers of $q$:
+Substituting and separating by powers of $q$ — with terminal condition
+$g(T,q,\mu)=0$, hence $\phi_1(T)=\phi_2(T)=0$:
 
 **Terms in $q^2$:**
 
-$$\dot\phi_2=\frac{\gamma\sigma^2}{2} \implies \phi_2(t)=\frac{\gamma\sigma^2}{2}\tau$$
+The cross-variation term $\rho\sigma\eta\,q\,\partial_\mu g=\rho\sigma\eta\,\phi_1 q^2$
+also lands here, so the exact ODE is
+$\dot\phi_2=\frac{\gamma\sigma^2}{2}-\rho\sigma\eta\,\phi_1(t)$, giving
+
+$$\phi_2(t)=-\frac{\gamma\sigma^2}{2}\tau+\rho\sigma\eta\!\int_t^T\!\phi_1(s)\,ds$$
+
+The second term is second-order in the signal ($\rho\eta$ small relative to
+$\gamma\sigma$ for any realistic calibration) and we drop it, keeping
+
+$$\dot\phi_2=\frac{\gamma\sigma^2}{2}
+\;\Longrightarrow\;
+\phi_2(t)=\phi_2(T)-\int_t^T\dot\phi_2\,ds
+=\boxed{-\frac{\gamma\sigma^2}{2}\tau}$$
+
+> **v2.2 (S1).** v2.1 printed $\phi_2=+\gamma\sigma^2\tau/2$. The ODE is integrated
+> *backward* from $\phi_2(T)=0$, so $\phi_2$ is **negative** — as it must be, since
+> $\phi_2 q^2$ is an inventory *penalty* inside a value function being maximised.
 
 **Terms in $\mu q$:**
 
-$$\dot\phi_1-\phi\phi_1+\rho\sigma\eta=0, \quad \phi_1(T)=0$$
+$$\dot\phi_1-\phi\phi_1+1=0, \quad \phi_1(T)=0$$
 
 **Solving the ODE for $\phi_1$:** general solution
-$\phi_1(t)=Ce^{\phi t}+\frac{\rho\sigma\eta}{\phi}$. Applying $\phi_1(T)=0$:
-$C=-\frac{\rho\sigma\eta}{\phi}e^{-\phi T}$. Therefore:
+$\phi_1(t)=Ce^{\phi t}+\frac{1}{\phi}$. Applying $\phi_1(T)=0$:
+$C=-\frac{1}{\phi}e^{-\phi T}$. Therefore, adding the measure-change discount
+$\rho_\mu\in(0,1]$ (the signal is estimated under $\mathbb{P}$, the quotes live under $\mathbb{Q}$):
 
-$$\boxed{\phi_1(t)=\frac{\rho\sigma\eta}{\phi}(1-e^{-\phi\tau})}$$
+$$\boxed{\phi_1(\tau)=\rho_\mu\cdot\frac{1-e^{-\phi\tau}}{\phi}}$$
 
-**Verification:** $\phi_1(T)=0$ ✓. As $\tau\to\infty$: $\phi_1\to\rho\sigma\eta/\phi$ (bounded). As $\tau\to 0$: $\phi_1\to 0$ — no time to exploit the signal.
+> **v2.2 (D).** v2.1 printed $\phi_1=(\rho\sigma\eta/\phi)(1-e^{-\phi\tau})$, which is
+> **dimensionally impossible**: with $[\mu]=$ nats/year, $\phi_1\hat\mu$ must come out
+> in nats, so $[\phi_1]=$ years. But $[\rho\sigma\eta/\phi]=(1/\sqrt{\text{yr}})\cdot
+> (\text{nats}/\text{yr}^{3/2})\cdot\text{yr}=\text{nats}/\text{yr}$, giving
+> $\phi_1\hat\mu$ in nats²/year². The error came from placing $\rho\sigma\eta$ (which
+> belongs to the $q^2$ cross-variation term) into the $\mu q$ equation, where the
+> coefficient of $\mu q$ in the HJB is simply $1$.
+>
+> $\eta$ therefore does **not** enter $\phi_1$. It remains part of the OU model —
+> calibrated by `CJCalibrator` and reported — but it prices the *option* to trade on
+> future alpha, which lives in $\phi_0$ and does not affect the quotes.
+
+**Interpretation.** $\phi_1$ is exactly the alpha a unit of inventory can still capture:
+
+$$\frac{1}{\mu_t}\int_t^T\mathbb{E}[\mu_s\mid\mu_t]\,ds
+=\int_0^\tau e^{-\phi u}\,du=\frac{1-e^{-\phi\tau}}{\phi}$$
+
+**Verification:** $\phi_1(T)=0$ ✓. As $\tau\to\infty$: $\phi_1\to\rho_\mu/\phi$ (bounded —
+an infinitely-lived signal is still worth only one mean-reversion time). As $\tau\to 0$:
+$\phi_1\to 0$ — no time left to exploit the signal. Units: years ✓.
 
 ### 4.5 Reservation Price with Signal
 
-$$\tilde{p}_t=S_t-\partial_q g=S_t-2\phi_2 q_t-\phi_1\hat\mu_t$$
+The reservation price is the **midpoint of the two quotes**. From §4.3,
+$\text{ask}=S+\delta^{a*}$ and $\text{bid}=S-\delta^{b*}$, so
+
+$$\tilde{p}_t=\frac{(S_t+\delta^{a*})+(S_t-\delta^{b*})}{2}
+=S_t+\frac{\delta^{a*}-\delta^{b*}}{2}
+=S_t+\partial_q g=S_t+2\phi_2 q_t+\phi_1\hat\mu_t$$
+
+Substituting $\phi_2=-\gamma\sigma^2\tau/2$ and $\phi_1=\rho_\mu(1-e^{-\phi\tau})/\phi$:
 
 $$\boxed{\tilde{p}_t=\underbrace{S_t-q_t\gamma\sigma^2\tau}_{\text{inventory skew (A-S)}}
-\;-\;\underbrace{\frac{\rho\sigma\eta}{\phi}(1-e^{-\phi\tau})\cdot\hat\mu_t}_{\text{signal skew}}}$$
+\;+\;\underbrace{\rho_\mu\frac{1-e^{-\phi\tau}}{\phi}\cdot\hat\mu_t}_{\text{signal skew}}}$$
 
-The spread $\delta^*=2/\kappa+\gamma\sigma^2\tau$ is unchanged from GLFT —
-the signal only shifts the centre of the quotes.
+> **v2.2 (S2).** v2.1 wrote $\tilde p=S-\partial_q g$, contradicting its own §4.3.
+> Combined with the $\phi_2$ sign error (S1) the two mistakes cancelled in the
+> inventory term — which is why $S-q\gamma\sigma^2\tau$ looked right — and left the
+> **signal** term with the wrong sign. Both the derivation above and the economics
+> agree on $+$: a positive expected drift means the MM wants to *accumulate* long
+> inventory, so it lifts both of its quotes. `cartea_jaimungal.py` had this right.
+
+The half-spread is unchanged from GLFT — the signal only shifts the centre:
+
+$$\delta^*=\gamma\sigma^2\tau+\frac{2}{\gamma}\ln\!\left(1+\frac{\gamma}{\kappa}\right)$$
 
 ### 4.6 Observable Signal and Calibration Pipeline
 
 The latent $\mu_t$ is not directly observed. We construct:
 
 $$\hat\mu_t = w_1\cdot\text{OBI}_t + w_2\cdot\text{NewsSignal}_t + w_3\cdot\text{OnChain}_t$$
+
+**Units matter here.** Each raw signal $s_k$ is a normalised score in $[-1,1]$;
+$\hat\mu_t$ must be a drift in nats/year. The conversion lives entirely in the
+weights $w_k$, which is exactly what the ridge regression of §4.6 estimates
+(signals regressed on subsequent log-odds returns per unit time). An
+*uncalibrated* ensemble — e.g. the placeholder $w=(1,0,0)$ — returns a score,
+not a drift, and must not be fed to the quoter.
 
 **Step 1 — Calibrate weights $w_i$** by Ridge regression on next-tick returns:
 
@@ -403,9 +495,26 @@ because $p_T \in \{0,1\}$. The Bernoulli bound is a model output, not an input.
 $\sigma_b(t,X)$ is estimated from realised quadratic variation of $X$ over
 short windows (EWMA, tick-rule denoised):
 
-$$\hat{\sigma}_b^2(t) = \text{EWMA}_\lambda\!\left[\frac{(\Delta X_i)^2}{\Delta t_i}\right]$$
+$$\hat{\sigma}_b^2(t) = \lambda\,\hat\sigma_b^2(t^-) + (1-\lambda)\,
+\frac{(\Delta X_i)^2}{\Delta t_i},\qquad \lambda=0.94$$
 
-with $\lambda=0.94$ (RiskMetrics: 94% weight on history). Two empirical regularities:
+(RiskMetrics convention: 94% weight on history, 6% on the new observation.)
+
+**Sampling is not a detail.** $\sum(\Delta X_i)^2/\Delta t_i$ is a realised-variance
+estimator, and realised variance **diverges as $\Delta t\to 0$** in the presence of
+microstructure noise: the bid-ask bounce contributes a fixed $(\Delta X)^2$ per tick
+while $\Delta t_i\to 0$ in the denominator. On this repository's own tick data
+(median $\Delta t \approx 1.1$ s) the tick-by-tick estimator overstates
+$\hat\sigma_b$ by roughly an order of magnitude; the noise ratio
+$\hat\sigma_b^{\text{tick}}/\hat\sigma_b^{\text{grid}}$ measured 3–16 across markets.
+
+We therefore estimate $\sigma_b$ on a **fixed sampling grid** of
+$\Delta t_{\text{sample}}$ (default 60 s) rather than tick-by-tick, which is the
+standard first-order defence against noise-induced RV explosion
+(Zhang–Mykland–Aït-Sahalia 2005). Increments are additionally winsorised and the
+result is clipped to a documented admissible band; a clip is logged, never silent.
+
+Two empirical regularities:
 
 1. $\sigma_b$ is **U-shaped in $p$** (peaked near $p\in\{0.4,0.6\}$, flat near
    boundaries), the opposite of $\sqrt{p(1-p)}$.
@@ -420,19 +529,40 @@ which returns $\sigma_b$ in units of $1/\sqrt{\text{year}}$ for direct use in
 $$\boxed{\tilde{X}(t,q) = X_t - q\cdot\gamma_I\cdot\bar{\sigma}_b^2(t)\cdot\tau} \tag{2.1}$$
 
 $$\boxed{\frac{\delta^*_X}{2} = \frac{\gamma_I\bar{\sigma}_b^2(t)\,\tau}{2}
-+ \frac{1}{\kappa_x}\ln\!\left(1+\frac{\gamma_I}{\kappa_x}\right)} \tag{2.2}$$
++ \frac{1}{\gamma_I}\ln\!\left(1+\frac{\gamma_I}{\kappa_x}\right)} \tag{2.2}$$
+
+> **v2.2 (R).** v2.1 wrote the rent term as $\frac{1}{\kappa_x}\ln(1+\gamma_I/\kappa_x)$,
+> the A-S approximation that §2.4 explicitly rejects — and which is in fact neither
+> the exact form $\frac1{\gamma}\ln(1+\gamma/\kappa)$ nor its $\gamma\ll\kappa$ limit
+> $\frac1\kappa$; it sits below both. At $\gamma_I=0.1,\ \kappa_x=0.8$ it understates
+> the rent by a factor of 8. Doc and code now both use the exact form.
+>
+> Note the consequence for calibration: with the exact rent term, $\kappa_x$ must be
+> large ($\mathcal{O}(10)$) for the half-spread to be sane. $\kappa_x\!\approx\!0.8$
+> implies a 53-cent spread at $p=0.5$.
 
 $$\text{bid}_p = \sigma(\tilde{X} - \delta^*_X/2), \qquad
 \text{ask}_p = \sigma(\tilde{X} + \delta^*_X/2)$$
 
 Tick floor (automatic boundary protection):
 
-$$\delta^{\text{quote}}_p = \max\!\bigl(p(1-p)\cdot\delta^*_X,\; \$0.01\bigr) \tag{2.3}$$
+$$\delta^{\text{quote}}_p = \max\!\bigl(p(1-p)\cdot\delta^*_X,\; \text{tick}(p)\bigr) \tag{2.3}$$
+
+> **v2.2 (T).** v2.1 fixed the tick at \$0.01. That is wrong on both target
+> venues: Polymarket declares `minimum_tick_size = 0.001`, and Kalshi publishes a
+> per-market ladder (`price_ranges`) whose main band steps by 0.001, with 0.0001
+> below \$0.01 and above \$0.99. With a \$0.01 tick, a market quoting
+> 0.0030/0.0040 received a bid of 0.0100 — buying at a cent what the book offers
+> at four tenths of a cent. $\text{tick}(p)$ is now the step of the band
+> containing $p$, read from venue metadata (`normalizer/price_grid.PriceLadder`),
+> and both quotes are anchored to that grid — bid down, ask up, so rounding can
+> only widen the spread, never tighten it.
 
 ```python
 # glft.py — espacio logit (implementation)
-reservation_X = X_t - inventory * gamma_I * sigma_bar_sq
-half_spread_X  = gamma_I * sigma_bar_sq / 2 + (1/kappa_x) * log(1 + gamma_I/kappa_x)
+gamma_eff     = gamma_I * regime.gamma_multiplier      # v2.2: §6.4 now applied
+reservation_X = X_t - inventory * gamma_eff * sigma_bar_sq
+half_spread_X = gamma_eff * sigma_bar_sq / 2 + (1/gamma_eff) * log(1 + gamma_eff/kappa_x)
 bid_p = sigma(reservation_X - half_spread_X)
 ask_p = sigma(reservation_X + half_spread_X)
 ```
@@ -491,7 +621,10 @@ $$\boxed{q_{\max}(t) = q^0_{\max}\cdot\exp(-r\cdot\psi(\tau)),
 
 ### 6.4 Practical Near-Resolution Rules
 
-Implemented in `features/resolution.py` and used by `strategies/market_making/glft.py`:
+Implemented in `features/resolution.py` (`effective_gamma`, `effective_q_max`) and
+applied by both quoters — `glft.py` and `cartea_jaimungal.py` — via
+`gamma_eff = gamma_I * rf.gamma_multiplier` before the spread and skew are formed.
+(Through v2.1 the multiplier was computed but never applied; fixed in v2.2.)
 
 ```
 τ ≥ 24h:  NORMAL   — q_max = Q·exp(-r·ψ(τ)),  γ_eff = γ
@@ -611,8 +744,8 @@ $(s_1,\ldots,s_K)$ and update only on the residuals.
 | Glosten-Milgrom | Adverse selection; asymmetric LR+/LR– in log-odds | Trader heterogeneity (MoE) |
 | Avellaneda-Stoikov | Inventory-optimal quotes, CARA + HJB in logit | Taylor approx for large $q$ |
 | GLFT exact | Exact HJB (ODE system), asymmetric spreads | Numerically costly for large $Q$ |
-| Cartea-Jaimungal | OU $\mu_t$ under $\mathbb{P}$; $\rho_\mu$ discount for measure risk | Multi-signal orthogonalisation |
-| Logit kernel (§5) | Single $\mathbb{Q}$-martingale; $\sigma_b(t,X)$ from realised QV | Hawkes-driven $\sigma_b$ |
+| Cartea-Jaimungal | OU $\mu_t$ under $\mathbb{P}$; alpha-capture $\phi_1=\rho_\mu(1-e^{-\phi\tau})/\phi$ | Multi-signal orthogonalisation |
+| Logit kernel (§5) | Single $\mathbb{Q}$-martingale; $\sigma_b(t,X)$ from noise-robust realised QV | Two-scale / Hawkes-driven $\sigma_b$ |
 | Jump-diffusion (§6) | $\lambda_J\propto\tau^{-\eta}$; second-moment loss; oracle option | MOOV2 proposer concentration |
 | Kelly v2.1 (§7) | $p_\text{eff}=p+r(1-2p)$; USDC basis; $c(1-c)$ denominator | Latency arbitrage (73% bots) |
 | Calibration (§8) | Brier + WBV−2WBC; Venn–Abers; out-of-time refit | Regime change / concept drift |
@@ -627,3 +760,5 @@ $(s_1,\ldots,s_K)$ and update only on the residuals.
 - Cartea, Á. & Jaimungal, S. (2015). *Enhancing trading strategies with order book signals.* Applied Mathematical Finance, 23(6), 1–35.
 - Kelly, J.L. (1956). *A new interpretation of information rate.* Bell System Technical Journal, 35(4), 917–926.
 - Murphy, A.H. (1973). *A new vector partition of the probability score.* Journal of Applied Meteorology, 12(4), 595–600.
+- Zhang, L., Mykland, P.A. & Aït-Sahalia, Y. (2005). *A tale of two time scales: determining integrated volatility with noisy high-frequency data.* Journal of the American Statistical Association, 100(472), 1394–1411.
+- Stephenson, D.B., Coelho, C.A.S. & Jolliffe, I.T. (2008). *Two extra components in the Brier score decomposition.* Weather and Forecasting, 23(4), 752–757.

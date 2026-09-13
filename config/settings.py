@@ -1,22 +1,22 @@
 """
 config/settings.py
 ───────────────────
-Configuración central del sistema.
+Central system configuration.
 
-Dos fuentes de configuración con responsabilidades distintas:
+Two configuration sources with distinct responsibilities:
 
-  1. Variables de entorno / .env  → secretos y configuración por entorno
-                                    Nunca en git.
+  1. Environment variables / .env → secrets and per-environment settings.
+                                    Never in git.
 
-  2. YAML de venue                → parámetros del modelo y riesgo
+  2. Per-venue YAML               → model and risk parameters
                                     Versionados en git.
-                                    Actualizados por notebooks de calibración
+                                    Updated by the calibration notebooks
                                     via update_model_params().
 
-Por qué el YAML es la única fuente de verdad para parámetros del modelo:
-  Si los defaults estuvieran en el código, no sabrías si el sistema
-  está usando parámetros calibrados o inventados. Con el YAML como
-  única fuente, si falta un campo lo sabes inmediatamente al arrancar.
+Why the YAML is the single source of truth for model parameters:
+  If defaults lived in the code you could not tell whether the system is
+  running calibrated or invented parameters. With the YAML as the source,
+  a missing field is apparent immediately at startup.
 """
 
 from __future__ import annotations
@@ -65,6 +65,76 @@ class Settings(BaseSettings):
     # Connectors
     manifold_poll_interval: int = Field(default=10)
 
+    # Which venues are ingested.
+    #
+    # Declaring them HERE rather than reading os.getenv() is not a style
+    # preference: pydantic-settings loads the .env into this object, not into
+    # os.environ, and `extra="ignore"` discards anything undeclared.
+    # build_connectors() used os.getenv("ENABLE_POLYMARKET", "false"), which
+    # never saw the value in .env — Polymarket stayed disabled unless the
+    # variable was exported by hand on the command line.
+    enable_kalshi: bool = Field(default=True)
+    enable_polymarket: bool = Field(default=True)
+    enable_manifold: bool = Field(default=True)
+
+    # ---------------------------------------------------------------- #
+    # Ingestion quality — which markets are worth the storage
+    # ---------------------------------------------------------------- #
+
+    # Maximum horizon to resolution, in days.
+    #
+    # A market resolving in 74 YEARS (Manifold has them) contributes nothing:
+    # we will never see its outcome, so it can neither calibrate Brier nor
+    # validate the signal, and its ticks only dilute the database. 45 days
+    # comfortably covers the horizons actually observed on Kalshi (1.9-14 d)
+    # and Polymarket (0-10.3 d), the two venues this project targets.
+    max_tau_days: float = Field(default=45.0)
+
+    # Require a two-sided book before ingesting a market.
+    #
+    # Without both a bid AND an ask there is no mid, no spread and no OBI —
+    # the three features that drive the quoter. A one-sided market costs rows
+    # and yields not one usable feature.
+    require_two_sided_book: bool = Field(default=True)
+
+    # Historical ticks backfilled per market on discovery.
+    #
+    # Manifold's backfill pulled 1000 bets per market — 31,000 of the
+    # database's 31,100 rows were exactly this, on markets resolving 117 days
+    # out. 0 disables it; the point is to seed the σ_b series without flooding.
+    backfill_max_ticks: int = Field(default=200)
+
+    # ---------------------------------------------------------------- #
+    # Database size cap
+    # ---------------------------------------------------------------- #
+
+    # Maximum DuckDB file size in MB. Once exceeded the writer stops accepting
+    # writes and logs the fact, rather than filling the disk in silence.
+    # 0 = no limit.
+    max_db_size_mb: float = Field(default=2048.0)
+
+    # How many flushes between size checks. Checking on every flush would be a
+    # stat() per batch; every 20 is enough to react within seconds.
+    db_size_check_every: int = Field(default=20)
+
+    # ---------------------------------------------------------------- #
+    # Refresco de metadatos
+    # ---------------------------------------------------------------- #
+
+    # How often, in seconds, the status of tracked markets is re-queried.
+    #
+    # This is what makes a resolution OBSERVABLE. Without this loop the market
+    # list froze at startup and `resolved_value` was never written, so no
+    # amount of ingestion time produced a single resolved market. 900 s = 15
+    # min: Kalshi sports markets resolve within minutes of the event, and a
+    # 15-minute lag is irrelevant for calibration.
+    market_refresh_seconds: int = Field(default=900)
+
+    # Heartbeat file published by the ingestion process. It is the ONLY way an
+    # external monitor can observe state: DuckDB grants the writer an exclusive
+    # lock and blocks reads from any other process.
+    status_file: str = Field(default="./data/ingest_status.json")
+
     @property
     def kalshi_enabled(self) -> bool:
         return bool(self.kalshi_api_key)
@@ -78,46 +148,46 @@ settings = Settings()
 
 
 # ---------------------------------------------------------------------------
-# Dataclasses de parámetros
+# Parameter dataclasses
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class RiskParams:
     """
-    Parámetros de gestión de riesgo.
+    Risk-management parameters.
 
-    Por qué no hay defaults aquí:
-      El YAML es la única fuente de verdad. Si falta un campo en el YAML
-      load_venue_config() lanza KeyError — así sabes exactamente
-      qué falta en lugar de silenciosamente usar un valor inventado.
+    Why there are no defaults here:
+      The YAML is the single source of truth. If a field is missing,
+      load_venue_config() raises KeyError — so you know exactly what is
+      missing instead of silently using an invented value.
 
-      Excepción: campos opcionales como max_daily_loss donde un default
-      conservador es aceptable como fallback.
+      Exception: optional fields such as max_daily_loss, where a conservative
+      default is acceptable as a fallback.
     """
 
     gamma: float  # Aversión al riesgo γ del MATH.md
-    q_max: int  # Inventario máximo en condiciones normales
-    max_daily_loss: float  # Pérdida diaria máxima antes de halt
-    max_position_loss: float  # Pérdida máxima por posición
+    q_max: int  # maximum inventory under normal conditions
+    max_daily_loss: float  # maximum daily loss before halting
+    max_position_loss: float  # maximum loss on a single position
 
 
 @dataclass
 class ModelParams:
     """
-    Parámetros del modelo de market making.
+    Market-making model parameters.
 
-    GLFT (§3 del MATH.md):
-      kappa: decay del arrival rate — calibrar por MLE sobre fill rates
-      A:     baseline arrival rate  — calibrar por MLE
+    GLFT (MATH.md §3):
+      kappa: arrival-rate decay — calibrate by MLE over fill rates
+      A:     baseline arrival rate — calibrate by MLE
 
-    Cartea-Jaimungal (§4 del MATH.md):
-      phi: mean-reversion speed de μ_t — calibrar por AR(1)
-      eta: volatilidad de μ_t         — calibrar por AR(1)
-      rho: correlación Δp_t ↔ Δμ̂_t   — calibrar por sample correlation
+    Cartea-Jaimungal (MATH.md §4):
+      phi: mean-reversion speed of μ_t — calibrate by AR(1)
+      eta: volatility of μ_t           — calibrate by AR(1)
+      rho: measure-change discount ρ_μ  — see cartea_jaimungal.py
 
-    Señal compuesta (§4.6 del MATH.md):
-      w_obi, w_news, w_onchain — calibrar por Ridge regression
+    Composite signal (MATH.md §4.6):
+      w_obi, w_news, w_onchain — calibrate by ridge regression
     """
 
     # GLFT
@@ -129,19 +199,19 @@ class ModelParams:
     eta: float
     rho: float
 
-    # Pesos de la señal
+    # Signal weights
     w_obi: float
     w_news: float
     w_onchain: float
 
-    # Metadata de calibración
-    # None si los parámetros son los iniciales del YAML (sin calibrar)
+    # Calibration metadata
+    # None when the parameters are the YAML's initial, uncalibrated values
     last_calibrated: datetime | None = None
 
 
 @dataclass
 class VenueConfig:
-    """Configuración completa de una venue."""
+    """Complete configuration for one venue."""
 
     name: str
     active_categories: list[str]
@@ -152,22 +222,22 @@ class VenueConfig:
 
 
 # ---------------------------------------------------------------------------
-# Carga desde YAML
+# Loading from YAML
 # ---------------------------------------------------------------------------
 
 
 def _load_yaml(path: Path) -> dict[str, Any]:
     """
-    Carga un YAML. Lanza FileNotFoundError si no existe.
+    Load a YAML file. Raises FileNotFoundError if it does not exist.
 
-    Por qué no devolver dict vacío:
-      Si el YAML no existe es un error de configuración, no una
-      situación normal. Queremos un error claro al arrancar.
+    Why not return an empty dict:
+      A missing YAML is a configuration error, not a normal condition to paper
+      over. We want a clear failure at startup.
     """
     if not path.exists():
         raise FileNotFoundError(
             f"Config file not found: {path}\n"
-            f"Crea el archivo o copia desde config/{path.name}.example"
+            f"Create the file, or copy it from config/{path.name}.example"
         )
     with open(path) as f:
         return yaml.safe_load(f) or {}
@@ -175,10 +245,10 @@ def _load_yaml(path: Path) -> dict[str, Any]:
 
 def load_venue_config(venue: str) -> VenueConfig:
     """
-    Carga la configuración de una venue desde su YAML.
+    Load a venue's configuration from its YAML file.
 
-    Lanza KeyError si falta un campo obligatorio — así es imposible
-    arrancar el sistema con parámetros incompletos silenciosamente.
+    Raises KeyError when a required field is missing — making it impossible to
+    start the system silently with incomplete parameters.
     """
     config_dir = Path(__file__).parent
     raw = _load_yaml(config_dir / f"{venue}.yaml")
@@ -223,25 +293,25 @@ def load_venue_config(venue: str) -> VenueConfig:
 
 
 # ---------------------------------------------------------------------------
-# Actualización de parámetros desde notebooks de calibración
+# Parameter updates from the calibration notebooks
 # ---------------------------------------------------------------------------
 
 
 def update_model_params(venue: str, params: dict[str, float]) -> None:
     """
-    Actualiza los parámetros del modelo en el YAML de la venue.
+    Update the venue's model parameters in its YAML file.
 
-    Llamado desde los notebooks de calibración después de estimar
-    los parámetros desde datos históricos reales.
+    Called from the calibration notebooks after estimating the parameters
+    from real historical data.
 
-    Preserva todos los demás campos del YAML — solo actualiza
-    los campos explícitamente proporcionados en params.
+    Every other field in the YAML is preserved — only the fields explicitly
+    supplied in params are modified.
 
     Args:
         venue:  "kalshi" | "polymarket" | "manifold"
-        params: dict con los parámetros a actualizar.
-                Solo los campos proporcionados se modifican.
-                Ejemplo:
+        params: dict of parameters to update. Only the fields supplied are
+                modified.
+                Example:
                   {
                     "kappa": 1.823,
                     "A":     0.094,
@@ -251,11 +321,11 @@ def update_model_params(venue: str, params: dict[str, float]) -> None:
                   }
 
     Raises:
-        FileNotFoundError: si el YAML del venue no existe
-        ValueError:        si un parámetro no es numérico
-        KeyError:          si un parámetro no existe en la sección model
+        FileNotFoundError: when the venue YAML does not exist
+        ValueError:        if a parameter is not numeric
+        KeyError:          if a parameter does not exist in the model section
 
-    Ejemplo de uso desde notebook:
+    Example use from a notebook:
         from config.settings import update_model_params
 
         update_model_params("kalshi", {
@@ -271,31 +341,31 @@ def update_model_params(venue: str, params: dict[str, float]) -> None:
     if not config_path.exists():
         raise FileNotFoundError(f"Config not found: {config_path}")
 
-    # Campos válidos del modelo — protección contra typos
+    # Valid model fields — protection against typos
     valid_fields = {"kappa", "A", "phi", "eta", "rho", "w_obi", "w_news", "w_onchain"}
 
     for key in params:
         if key not in valid_fields:
             raise KeyError(
-                f"Unknown model parameter: '{key}'. " f"Valid fields: {sorted(valid_fields)}"
+                f"Unknown model parameter: '{key}'. Valid fields: {sorted(valid_fields)}"
             )
         if not isinstance(params[key], int | float):
             raise ValueError(f"Parameter '{key}' must be numeric, got {type(params[key])}")
 
-    # Leer YAML actual preservando estructura y comentarios
-    # Nota: yaml.safe_load pierde los comentarios — si quieres preservarlos
-    # usa ruamel.yaml. Para ahora yaml.dump es suficiente.
+    # Read the current YAML, preserving structure and comments.
+    # Note: yaml.safe_load drops comments — use ruamel.yaml if you need them
+    # preserved. For now yaml.dump is sufficient.
     with open(config_path) as f:
         config = yaml.safe_load(f) or {}
 
     if "model" not in config:
         config["model"] = {}
 
-    # Actualizar solo los campos proporcionados
+    # Update only the fields supplied
     for key, value in params.items():
         config["model"][key] = round(float(value), 8)
 
-    # Registrar cuándo se calibró por última vez
+    # Record when the last calibration happened
     config["model"]["last_calibrated"] = datetime.now(tz=UTC).isoformat()
 
     # Escribir YAML actualizado
@@ -305,11 +375,11 @@ def update_model_params(venue: str, params: dict[str, float]) -> None:
             f,
             default_flow_style=False,
             allow_unicode=True,
-            sort_keys=False,  # preservar el orden original de los campos
+            sort_keys=False,  # preserve the original field order
         )
 
-    # Recargar la config en memoria para que el cambio sea inmediato
-    # sin necesidad de reiniciar el sistema
+    # Reload the in-memory config so the change takes effect immediately,
+    # with no need to restart the system
     _reload_venue_config(venue)
 
     print(
@@ -321,13 +391,13 @@ def update_model_params(venue: str, params: dict[str, float]) -> None:
 
 def _reload_venue_config(venue: str) -> None:
     """
-    Recarga la config de un venue en las variables globales.
-    Llamado automáticamente por update_model_params().
+    Reload a venue's config into the global variables.
+    Called automatically by update_model_params().
 
-    Por qué recargar en memoria:
-      Si el sistema está corriendo y calibras en un notebook,
-      quieres que los nuevos parámetros se usen en el siguiente
-      ciclo de quoting sin reiniciar el sistema.
+    Why reload in memory:
+      If the system is running and you calibrate from a notebook, you want the
+      new parameters to take effect on the next quoting cycle without
+      restarting the system.
     """
     global kalshi_config, polymarket_config, manifold_config
 
@@ -341,10 +411,10 @@ def _reload_venue_config(venue: str) -> None:
 
 def calibration_status() -> None:
     """
-    Imprime el estado de calibración de todos los venues.
-    Útil para saber si los parámetros son los iniciales o calibrados.
+    Print the calibration status of every venue.
+    Useful for telling whether the parameters are initial or calibrated.
 
-    Uso desde notebook o terminal:
+    Use from a notebook or the terminal:
         from config.settings import calibration_status
         calibration_status()
     """
@@ -368,7 +438,7 @@ def calibration_status() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Configs pre-cargadas — importar estos objetos en el resto del sistema
+# Pre-loaded configs — import these objects elsewhere in the system
 # ---------------------------------------------------------------------------
 
 kalshi_config = load_venue_config("kalshi")

@@ -1,7 +1,7 @@
 """
 backtesting/metrics.py
 ──────────────────────
-Cálculo de métricas de rendimiento y riesgo para el backtest.
+Performance and risk metrics for the backtester.
 """
 
 from __future__ import annotations
@@ -14,26 +14,26 @@ import pandas as pd
 
 def calculate_metrics(trace_df: pd.DataFrame, initial_cash: float) -> dict[str, Any]:
     """
-    Calcula métricas clave a partir de la traza temporal del backtest.
+    Compute the key metrics from the backtest's time-ordered trace.
 
-    La traza debe contener las columnas:
+    The trace must contain the columns:
       - timestamp (datetime)
       - cash (float)
-      - position (float) (posición firmada de YES)
-      - mid_price (float) (precio de referencia del mercado)
-      - bid_p (float) (precio de compra cotizado, puede ser NaN)
-      - ask_p (float) (precio de venta cotizado, puede ser NaN)
-      - action (str, opcional) (ej. 'BUY', 'SELL', o vacía si es snapshot de estado)
-      - order_status (str, opcional) (ej. 'FILLED')
+      - position (float) — the signed YES position
+      - mid_price (float) — the market's reference price
+      - bid_p (float) — our quoted bid, may be NaN
+      - ask_p (float) — our quoted ask, may be NaN
+      - action (str, optional) — e.g. 'BUY', 'SELL', or empty for a state snapshot
+      - order_status (str, optional) — e.g. 'FILLED'
 
-    Métricas calculadas:
-      - PnL Total (realizado + valorización de posición a mid-price)
-      - Retorno Total (%)
-      - Sharpe Ratio (anualizado sobre retornos diarios)
-      - Max Drawdown (en valor absoluto de dólares y en porcentaje)
-      - Ratio de Fills (porcentaje de órdenes completadas sobre colocadas)
-      - Estadísticas de Inventario (min, max, promedio, desviación estándar)
-      - Spread Promedio cotizado (en espacio precio)
+    Metrics computed:
+      - Total PnL (realised + position marked to mid)
+      - Total return (%)
+      - Sharpe ratio (annualised over daily returns)
+      - Max drawdown (in absolute dollars and as a percentage)
+      - Fill rate (percentage of placed orders that filled)
+      - Inventory statistics (min, max, mean, standard deviation)
+      - Average quoted spread (in price space)
     """
     if trace_df.empty:
         return {
@@ -51,7 +51,7 @@ def calculate_metrics(trace_df: pd.DataFrame, initial_cash: float) -> dict[str, 
             "avg_spread": 0.0,
         }
 
-    # Copiar para evitar SideEffects
+    # Copy to avoid side effects
     df = trace_df.copy()
     df["timestamp"] = pd.to_datetime(df["timestamp"])
 
@@ -64,13 +64,13 @@ def calculate_metrics(trace_df: pd.DataFrame, initial_cash: float) -> dict[str, 
     total_return_pct = (total_pnl / initial_cash) * 100.0
 
     # 2. Sharpe Ratio Diario Anualizado
-    # Resamplear a diario usando el último valor conocido de cada día (forward fill)
+    # Resample to daily using each day's last known value (forward fill)
     df_daily = df.set_index("timestamp")["equity"].resample("D").last().ffill()
     daily_returns = df_daily.pct_change().dropna()
 
-    # Si hay muy pocos datos o no hay variación, Sharpe es 0
+    # With too little data or no variation, Sharpe is 0
     if len(daily_returns) > 1 and daily_returns.std() > 1e-8:
-        # Sharpe = (mean / std) * sqrt(365) (los prediction markets operan 24/7/365)
+        # Sharpe = (mean / std) * sqrt(365) — prediction markets trade 24/7/365
         sharpe = (daily_returns.mean() / daily_returns.std()) * np.sqrt(365.0)
     else:
         sharpe = 0.0
@@ -85,15 +85,15 @@ def calculate_metrics(trace_df: pd.DataFrame, initial_cash: float) -> dict[str, 
     max_dd_pct = float(df["dd_pct"].max())
 
     # 4. Trades & Fill Rate
-    # Un trade es un fill confirmado
+    # A trade is a confirmed fill
     trade_count = 0
     if "order_status" in df.columns:
-        # Contar filas donde hubo un fill
+        # Count the rows where a fill occurred
         trade_count = int((df["order_status"] == "FILLED").sum())
 
     submitted_count = 0
     if "action" in df.columns:
-        # Contar órdenes enviadas (acciones BUY o SELL)
+        # Count submitted orders (BUY or SELL actions)
         submitted_count = int(df["action"].isin(["BUY", "SELL"]).sum())
 
     fill_rate = (trade_count / submitted_count * 100.0) if submitted_count > 0 else 0.0

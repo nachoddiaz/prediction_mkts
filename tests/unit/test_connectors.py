@@ -1,24 +1,23 @@
 """
 tests/unit/test_connectors.py
 ───────────────────────────────
-Tests de los tres connectors.
+Tests for the three connectors.
 
-Por qué mocks y no llamadas HTTP reales:
-  Los tests deben ser deterministas y rápidos.
-  Una llamada real a Kalshi puede tardar 200ms, fallar por rate limit,
-  o devolver datos distintos en cada ejecución.
-  Con mocks controlamos exactamente qué devuelve la API y verificamos
-  que el connector lo transforma correctamente.
+Why mocks and not real HTTP calls:
+  Tests must be deterministic and fast. A real call to Kalshi can take 200 ms,
+  fail on rate limits, or return different data on every run. With mocks we
+  control exactly what the API returns and verify that the connector
+  transforms it correctly.
 
-Patrón usado — aiohttp MockSession:
-  Reemplazamos aiohttp.ClientSession con una clase fake que devuelve
-  respuestas predefinidas. El connector no sabe que está hablando
-  con un mock — su código es idéntico al de producción.
+The pattern used — an aiohttp MockSession:
+  A class mimicking aiohttp.ClientSession that returns canned responses. The
+  connector does not know it is talking to a mock — its code is identical to
+  production.
 
-Por qué no usar unittest.mock.patch:
-  patch requiere conocer la ruta de importación exacta y es frágil
-  ante refactorizaciones. Una clase mock explícita es más legible
-  y más fácil de mantener.
+Why not unittest.mock.patch:
+  patch requires knowing the exact import path and is fragile under
+  refactoring. An explicit mock class is more readable and easier to
+  maintain.
 """
 
 from __future__ import annotations
@@ -47,7 +46,7 @@ from normalizer.schema import (
 )
 
 # ---------------------------------------------------------------------------
-# Fixtures de datos crudos — simulan respuestas reales de las APIs
+# Raw data fixtures — they mimic real API responses
 # ---------------------------------------------------------------------------
 
 KALSHI_MARKET_RAW = {
@@ -99,16 +98,16 @@ MANIFOLD_MARKET_RAW = {
 # ---------------------------------------------------------------------------
 # Mock de aiohttp.ClientSession
 #
-# Por qué una clase y no un AsyncMock directamente:
-#   aiohttp usa context managers async para los requests:
+# Why a class rather than an AsyncMock directly:
+#   aiohttp uses async context managers for requests:
 #     async with session.get(url) as resp:
-#   AsyncMock no soporta este patrón directamente.
-#   Una clase con __aenter__/__aexit__ lo implementa correctamente.
+#   AsyncMock does not support that pattern directly, whereas a class with
+#   __aenter__/__aexit__ implements it correctly.
 # ---------------------------------------------------------------------------
 
 
 class MockResponse:
-    """Simula una respuesta HTTP de aiohttp."""
+    """Simulates an aiohttp HTTP response."""
 
     def __init__(self, data: Any, status: int = 200) -> None:
         self._data = data
@@ -126,10 +125,10 @@ class MockResponse:
 
 class MockSession:
     """
-    Simula aiohttp.ClientSession.
+    Simulates aiohttp.ClientSession.
 
     routes: dict de url → respuesta
-    Permite definir respuestas distintas por URL.
+    Allows a different response per URL.
     """
 
     def __init__(self, routes: dict[str, Any]) -> None:
@@ -137,7 +136,7 @@ class MockSession:
         self.closed = False
 
     def get(self, url: str, **kwargs: Any) -> MockResponse:
-        # Buscar por URL exacta o por prefijo
+        # Match on exact URL or prefix
         for pattern, data in self._routes.items():
             if url.startswith(pattern) or pattern in url:
                 return MockResponse(data)
@@ -180,7 +179,7 @@ def make_kalshi_connector(**kwargs) -> KalshiConnector:
         on_tick=on_tick,
         on_snapshot=on_snapshot,
         api_key="test-key",
-        private_key_path="/nonexistent/path.pem",  # sin firma real en tests
+        private_key_path="/nonexistent/path.pem",  # no real signing in tests
         env="demo",
         **kwargs,
     )
@@ -205,20 +204,26 @@ def make_manifold_connector(poll_interval: int = 1) -> ManifoldConnector:
 
 class TestKalshiConnector:
     def setup_method(self) -> None:
-        """Limpiar callbacks antes de cada test."""
+        """Clear callbacks before each test."""
         ticks_received.clear()
         snapshots_received.clear()
 
     @pytest.mark.asyncio
-    async def test_get_markets_devuelve_lista(self) -> None:
+    async def test_get_markets_returns_list(self) -> None:
         """
-        get_markets() debe parsear la respuesta de la API y devolver
-        una lista de objetos Market del dominio.
+        get_markets() must parse the API response and return
+        a list of domain Market objects.
         """
         connector = make_kalshi_connector()
+        # Order matters: MockSession matches on substrings, and "/markets"
+        # would match "/markets/trades". The most specific path goes first.
         connector._session = MockSession(
             {
                 "/series": {"series": []},
+                "/markets/trades": {
+                    "trades": [{"ticker": KALSHI_MARKET_RAW["ticker"]}],
+                    "cursor": None,
+                },
                 "/markets": {"markets": [KALSHI_MARKET_RAW]},
             }
         )
@@ -231,8 +236,8 @@ class TestKalshiConnector:
         assert markets[0].market_id.raw_id == "KXBTC-26APR22-T85000"
 
     @pytest.mark.asyncio
-    async def test_get_markets_api_vacia(self) -> None:
-        """Si la API devuelve lista vacía, get_markets() devuelve []."""
+    async def test_get_markets_empty_api(self) -> None:
+        """When the API returns an empty list, get_markets() returns []."""
         connector = make_kalshi_connector()
         connector._session = MockSession(
             {
@@ -254,10 +259,10 @@ class TestKalshiConnector:
         assert markets == []
 
     @pytest.mark.asyncio
-    async def test_get_snapshot_devuelve_snapshot(self) -> None:
+    async def test_get_snapshot_returns_snapshot(self) -> None:
         """
-        get_snapshot() debe fetchear market y orderbook en paralelo
-        y construir un MarketSnapshot completo.
+        get_snapshot() must fetch market and order book in parallel and build
+        a complete MarketSnapshot.
         """
         connector = make_kalshi_connector()
         connector._session = MockSession(
@@ -269,15 +274,15 @@ class TestKalshiConnector:
 
         snapshot = await connector.get_snapshot("kalshi:KXBTC-26APR22-T85000")
 
-        # El snapshot puede ser None si el adapter falla — lo que
-        # verificamos es que el connector no lanza excepción
-        # El test de contenido está en test_normalizer.py
+        # The snapshot may be None if the adapter fails — what we verify
+        # here is that the connector does not raise.
+        # Content assertions live in the normalizer tests.
         assert snapshot is None or isinstance(snapshot, MarketSnapshot)
 
     @pytest.mark.asyncio
     async def test_handle_ws_trade(self) -> None:
         """
-        Un mensaje trade del WS debe llamar on_tick con un Tick TRADE.
+        A WS trade message must call on_tick with a TRADE Tick.
         """
         connector = make_kalshi_connector()
 
@@ -294,14 +299,14 @@ class TestKalshiConnector:
         }
 
         await connector._handle_ws_message(msg)
-        # El handler puede llamar on_tick o no dependiendo del adapter
-        # Lo importante es que no lanza excepción
+        # The handler may or may not call on_tick depending on the adapter;
+        # what matters is that it does not raise
         assert True
 
     @pytest.mark.asyncio
     async def test_handle_ws_ticker(self) -> None:
         """
-        Un mensaje ticker del WS con precios válidos debe llamar on_tick.
+        A WS ticker message with valid prices must call on_tick.
         """
         connector = make_kalshi_connector()
 
@@ -321,9 +326,9 @@ class TestKalshiConnector:
         assert ticks_received[0].yes_ask == pytest.approx(0.46)
 
     @pytest.mark.asyncio
-    async def test_handle_ws_ticker_precios_invalidos(self) -> None:
+    async def test_handle_ws_ticker_invalid_prices(self) -> None:
         """
-        Ticker con precios inválidos (bid >= ask) no debe emitir tick.
+        A ticker with invalid prices (bid >= ask) must not emit a tick.
         """
         connector = make_kalshi_connector()
 
@@ -340,17 +345,18 @@ class TestKalshiConnector:
         assert len(ticks_received) == 0
 
     @pytest.mark.asyncio
-    async def test_build_headers_incluye_api_key(self) -> None:
+    async def test_build_headers_includes_api_key(self) -> None:
         connector = make_kalshi_connector()
         headers = connector._build_headers()
         assert "KALSHI-ACCESS-KEY" in headers
         assert headers["KALSHI-ACCESS-KEY"] == "test-key"
 
     @pytest.mark.asyncio
-    async def test_sign_incluye_timestamp(self) -> None:
+    async def test_sign_includes_timestamp(self) -> None:
         """
-        _sign() debe incluir KALSHI-ACCESS-TIMESTAMP.
-        Sin firma real (sin PEM) el signature estará vacío — aceptable en tests.
+        _sign() must include KALSHI-ACCESS-TIMESTAMP.
+        Without a real signature (no PEM) the signature is empty — acceptable
+        in tests.
         """
         connector = make_kalshi_connector()
         headers = connector._sign("GET", "/trade-api/v2/markets")
@@ -369,7 +375,7 @@ class TestPolymarketConnector:
         snapshots_received.clear()
 
     @pytest.mark.asyncio
-    async def test_get_markets_devuelve_lista(self) -> None:
+    async def test_get_markets_returns_list(self) -> None:
         connector = make_polymarket_connector()
         connector._session = MockSession(
             {
@@ -386,7 +392,7 @@ class TestPolymarketConnector:
     @pytest.mark.asyncio
     async def test_get_markets_pobla_cache_tokens(self) -> None:
         """
-        get_markets() debe poblar _token_to_market para que
+        get_markets() must populate _token_to_market so the
         el WS handler pueda resolver token_id → market_id.
         """
         connector = make_polymarket_connector()
@@ -404,7 +410,7 @@ class TestPolymarketConnector:
     @pytest.mark.asyncio
     async def test_get_markets_infiere_tags(self) -> None:
         """
-        Si tags está vacío, debe inferir la categoría desde la pregunta.
+        With empty tags, the category must be inferred from the question.
         """
         raw_sin_tags = {**POLYMARKET_MARKET_RAW, "tags": []}
         connector = make_polymarket_connector()
@@ -416,14 +422,14 @@ class TestPolymarketConnector:
 
         markets = await connector.get_markets()
         assert len(markets) == 1
-        # "Bitcoin" en la pregunta → crypto
+        # "Bitcoin" in the question → crypto
         assert markets[0].category.value == "crypto"
 
     @pytest.mark.asyncio
-    async def test_get_snapshot_construye_orderbook(self) -> None:
+    async def test_get_snapshot_builds_orderbook(self) -> None:
         """
-        get_snapshot() debe construir un orderbook parcial desde
-        /midpoint y /price aunque no tengamos el libro completo.
+        get_snapshot() must build a partial order book from
+        /midpoint and /price even without the full book.
         """
         connector = make_polymarket_connector()
 
@@ -451,18 +457,18 @@ class TestPolymarketConnector:
         connector._session = MockSession(
             {
                 "midpoint": {"mid": "0.0135"},
-                "price": {"price": "0.014"},  # BUY (ask) y SELL (bid) usan misma ruta mock
+                "price": {"price": "0.014"},  # BUY (ask) and SELL (bid) share the mock route
             }
         )
 
         snapshot = await connector.get_snapshot(market_id)
-        # Puede ser None si el mock no cubre todas las URLs exactas
+        # May be None when the mock does not cover every exact URL
         assert snapshot is None or isinstance(snapshot, MarketSnapshot)
 
     @pytest.mark.asyncio
     async def test_handle_price_change(self) -> None:
         """
-        Un evento price_change del WS debe llamar on_tick.
+        A WS price_change event must call on_tick.
         """
         connector = make_polymarket_connector()
 
@@ -489,9 +495,9 @@ class TestPolymarketConnector:
         }
 
         await connector._handle_ws_event(event)
-        # El handler llama al adapter — puede o no emitir tick
-        # dependiendo de la implementación del adapter
-        assert True  # no lanza excepción
+        # The handler calls the adapter — it may or may not emit a tick,
+        # depending on the adapter implementation
+        assert True  # it does not raise
 
     @pytest.mark.asyncio
     async def test_infer_tags_crypto(self) -> None:
@@ -508,7 +514,7 @@ class TestPolymarketConnector:
         tags = PolymarketConnector._infer_tags("Will it rain in London tomorrow?")
         assert tags == []
 
-    def test_build_headers_sin_auth(self) -> None:
+    def test_build_headers_without_auth(self) -> None:
         connector = make_polymarket_connector()
         headers = connector._build_headers()
         assert "Accept" in headers
@@ -526,7 +532,7 @@ class TestManifoldConnector:
         snapshots_received.clear()
 
     @pytest.mark.asyncio
-    async def test_get_markets_devuelve_lista(self) -> None:
+    async def test_get_markets_returns_list(self) -> None:
         connector = make_manifold_connector()
         connector._session = MockSession(
             {
@@ -541,8 +547,8 @@ class TestManifoldConnector:
         assert markets[0].market_id.venue == Venue.MANIFOLD
 
     @pytest.mark.asyncio
-    async def test_get_markets_filtra_sin_close_time(self) -> None:
-        """Mercados sin closeTime deben ser ignorados."""
+    async def test_get_markets_filters_missing_close_time(self) -> None:
+        """Markets without a closeTime must be ignored."""
         raw_sin_close = {**MANIFOLD_MARKET_RAW, "closeTime": None}
         connector = make_manifold_connector()
         connector._session = MockSession(
@@ -555,10 +561,10 @@ class TestManifoldConnector:
         assert markets == []
 
     @pytest.mark.asyncio
-    async def test_get_snapshot_construye_orderbook_sintetico(self) -> None:
+    async def test_get_snapshot_builds_synthetic_orderbook(self) -> None:
         """
-        Manifold no tiene CLOB — get_snapshot() debe construir
-        un orderbook sintético desde probability.
+        Manifold has no CLOB — get_snapshot() must build
+        a synthetic order book from the probability.
         """
         connector = make_manifold_connector()
         connector._session = MockSession(
@@ -571,15 +577,15 @@ class TestManifoldConnector:
 
         assert snapshot is not None
         assert isinstance(snapshot, MarketSnapshot)
-        # El orderbook sintético tiene bid < ask
+        # The synthetic order book has bid < ask
         assert snapshot.orderbook is not None
         assert snapshot.orderbook.best_bid < snapshot.orderbook.best_ask
 
     @pytest.mark.asyncio
-    async def test_poll_emite_tick_si_precio_cambia(self) -> None:
+    async def test_poll_emits_tick_when_price_changes(self) -> None:
         """
-        _poll_market() debe emitir snapshot si el precio cambió
-        más de 0.1% desde el último poll.
+        _poll_market() must emit a snapshot when the price moved more
+        than 0.1% since the last poll.
         """
         connector = make_manifold_connector()
         connector._session = MockSession(
@@ -588,7 +594,7 @@ class TestManifoldConnector:
             }
         )
 
-        # Sin precio previo → debe emitir
+        # No previous price → must emit
         connector._last_prices["manifold:will-btc-hit-150k"] = 0.40
         await connector._poll_market("manifold:will-btc-hit-150k")
 
@@ -596,9 +602,9 @@ class TestManifoldConnector:
         assert len(snapshots_received) == 1
 
     @pytest.mark.asyncio
-    async def test_poll_no_emite_si_precio_igual(self) -> None:
+    async def test_poll_emits_nothing_when_price_unchanged(self) -> None:
         """
-        Si el precio no cambió, no debe emitir ningún tick o snapshot.
+        When the price has not moved, no tick or snapshot may be emitted.
         """
         connector = make_manifold_connector()
         connector._session = MockSession(
@@ -607,7 +613,7 @@ class TestManifoldConnector:
             }
         )
 
-        # Precio igual al actual (prob=0.45)
+        # A price equal to the current one (prob=0.45)
         connector._last_prices["manifold:will-btc-hit-150k"] = 0.45
         await connector._poll_market("manifold:will-btc-hit-150k")
 
@@ -615,8 +621,8 @@ class TestManifoldConnector:
         assert len(ticks_received) == 0
 
     @pytest.mark.asyncio
-    async def test_synthetic_orderbook_bid_menor_ask(self) -> None:
-        """El orderbook sintético siempre debe tener bid < ask."""
+    async def test_synthetic_orderbook_bid_below_ask(self) -> None:
+        """The synthetic order book must always have bid < ask."""
         from normalizer.schema import Venue
 
         mid = MarketId(Venue.MANIFOLD, "test")
@@ -626,8 +632,8 @@ class TestManifoldConnector:
             assert ob.best_bid < ob.best_ask, f"Fallo en prob={prob}"
 
     @pytest.mark.asyncio
-    async def test_synthetic_orderbook_precios_en_rango(self) -> None:
-        """bid y ask deben estar en (0, 1)."""
+    async def test_synthetic_orderbook_prices_in_range(self) -> None:
+        """bid and ask must lie in (0, 1)."""
         from normalizer.schema import Venue
 
         mid = MarketId(Venue.MANIFOLD, "test")
@@ -652,7 +658,7 @@ class TestManifoldConnector:
         cat = ManifoldConnector._infer_category("Will it snow in Madrid?")
         assert cat == MarketCategory.OTHER
 
-    def test_build_headers_sin_auth(self) -> None:
+    def test_build_headers_without_auth(self) -> None:
         connector = make_manifold_connector()
         headers = connector._build_headers()
         assert "Accept" in headers
@@ -669,10 +675,10 @@ class TestBaseConnector:
         snapshots_received.clear()
 
     @pytest.mark.asyncio
-    async def test_get_retry_en_500(self) -> None:
+    async def test_get_retries_on_500(self) -> None:
         """
-        _get() debe reintentar automáticamente en errores 5xx.
-        Después de MAX_RETRIES intentos devuelve None.
+        _get() must retry automatically on 5xx errors.
+        After MAX_RETRIES attempts it returns None.
         """
         connector = make_kalshi_connector()
 
@@ -685,15 +691,15 @@ class TestBaseConnector:
 
         connector._session = MockSession500({})
 
-        # Todos los intentos fallan → None
+        # Every attempt fails → None
         result = await connector._get("https://api.kalshi.com/any")
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_get_no_reintenta_en_404(self) -> None:
+    async def test_get_does_not_retry_on_404(self) -> None:
         """
-        _get() NO debe reintentar en errores 4xx (client error).
-        Devuelve None inmediatamente.
+        _get() must NOT retry on 4xx (client) errors.
+        Returns None immediately.
         """
         connector = make_kalshi_connector()
         connector._session = MockSession({})  # todas las URLs → 404
@@ -702,10 +708,10 @@ class TestBaseConnector:
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_get_sin_session_devuelve_none(self) -> None:
+    async def test_get_without_session_returns_none(self) -> None:
         """
-        Llamar _get() antes de abrir la sesión devuelve None
-        sin lanzar excepción.
+        Calling _get() before the session is opened returns None without
+        raising.
         """
         connector = make_kalshi_connector()
         connector._session = None

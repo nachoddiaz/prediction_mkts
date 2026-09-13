@@ -1,7 +1,7 @@
 """
 tests/unit/test_router.py
 ─────────────────────────
-Tests unitarios para el enrutador de órdenes (OrderRouter).
+Unit tests for the order router (OrderRouter).
 """
 
 from __future__ import annotations
@@ -55,7 +55,7 @@ def router() -> OrderRouter:
 
 
 def test_quote_invalid_cancels_all(router, market_id):
-    """Verifica que una cotización marcada como no válida cancele todas las órdenes activas."""
+    """A quote marked invalid must cancel every resting order."""
     account = router.paper_engine.account
     o1 = account.create_order(market_id, OrderAction.BUY, 0.40, 1.0)
     o1.status = OrderStatus.ACTIVE
@@ -80,7 +80,7 @@ def test_quote_invalid_cancels_all(router, market_id):
         ask_X=0.1,
         bid_p=0.42,
         ask_p=0.48,
-        is_valid=False,  # <--- INVÁLIDO
+        is_valid=False,  # <--- INVALID
         invalid_reason="regime halt",
     )
 
@@ -92,14 +92,14 @@ def test_quote_invalid_cancels_all(router, market_id):
 
 def test_circuit_breaker_halts_quoting(router, market_id):
     """
-    Verifica que si el circuit breaker se dispara se cancelen todas las órdenes
-    y se detenga el quoting.
+    Verifies that when the circuit breaker trips, every resting order is
+    cancelled and quoting stops.
     """
     account = router.paper_engine.account
     o1 = account.create_order(market_id, OrderAction.BUY, 0.40, 1.0)
     o1.status = OrderStatus.ACTIVE
 
-    # Provocar una pérdida diaria masiva actualizando directamente la caja de la cuenta
+    # Force a large daily loss by adjusting the account cash directly
     account._cash_balance = 9000.0
     router.mid_prices[market_id] = 0.50
     router.risk_monitor.update(
@@ -137,7 +137,7 @@ def test_circuit_breaker_halts_quoting(router, market_id):
 
 
 def test_place_and_replace_orders(router, market_id):
-    """Verifica que el router coloque nuevas órdenes y reemplace aquellas cuyo precio cambie."""
+    """The router places new orders and replaces those whose price changed."""
     account = router.paper_engine.account
 
     quote1 = Quote(
@@ -164,9 +164,9 @@ def test_place_and_replace_orders(router, market_id):
         invalid_reason="",
     )
 
-    # 1. Colocación inicial
+    # 1. Initial placement
     affected = router.on_quote(quote1, size=1.0)
-    assert len(affected) == 2  # una de compra, una de venta
+    assert len(affected) == 2  # one buy, one sell
     active = account.get_active_orders(market_id)
     assert len(active) == 2
 
@@ -175,11 +175,11 @@ def test_place_and_replace_orders(router, market_id):
     assert buy_o.price == 0.45
     assert sell_o.price == 0.55
 
-    # 2. Llamada redundante con mismos precios no debe reemplazar (evita churning)
+    # 2. A redundant call at the same prices must not replace (avoids churning)
     affected2 = router.on_quote(quote1, size=1.0)
     assert len(affected2) == 0
 
-    # 3. Llamar con precio modificado debe cancelar y crear una nueva
+    # 3. Calling with a changed price must cancel and create a new order
     quote2 = Quote(
         market_id=market_id,
         timestamp=datetime.now(UTC),
@@ -205,7 +205,7 @@ def test_place_and_replace_orders(router, market_id):
     )
 
     affected3 = router.on_quote(quote2, size=1.0)
-    # Debe contener 2 IDs: cancelación de la antigua de compra, y la nueva de compra
+    # It must contain 2 IDs: the cancellation of the old buy, and the new buy
     assert len(affected3) == 2
     assert buy_o.status == OrderStatus.CANCELLED
 
@@ -217,19 +217,19 @@ def test_place_and_replace_orders(router, market_id):
 
 def test_near_resolution_side_halt(router, market_id, market):
     """
-    Verifica que en régimen de warning/crítico se detenga el quoting del lado
-    que añade riesgo al inventario.
+    Verifies that under a warning/critical regime, quoting stops on the side
+    that would add inventory risk.
     """
     account = router.paper_engine.account
 
-    # Supongamos que tenemos inventario largo (q > 0)
+    # Assume we are long (q > 0)
     account._positions[market_id] = 5.0
 
-    # Usar un timestamp ficticio para el quote muy cercano al resolution_date
-    # para forzar régimen CRITICAL/WARNING
+    # Use a quote timestamp very close to resolution_date to force a
+    # CRITICAL/WARNING regime
     now_ts = datetime.now(UTC)
 
-    # Hacemos mock de la fecha de resolución para que quede en 10 minutos
+    # Mock the resolution date so it lands 10 minutes out
     from datetime import timedelta
 
     market = Market(
@@ -267,8 +267,8 @@ def test_near_resolution_side_halt(router, market_id, market):
     router.on_quote(quote, size=1.0, market=market)
     active = account.get_active_orders(market_id)
 
-    # Al tener inventario largo en régimen CRITICAL, se debe desactivar el lado de compra (BUY)
-    # Por tanto, solo debe haber 1 orden activa y debe ser de VENTA
+    # Long inventory under CRITICAL must disable the BUY side
+    # So there must be exactly 1 active order, and it must be a SELL
     assert len(active) == 1
     assert active[0].action == OrderAction.SELL
     assert active[0].price == 0.55

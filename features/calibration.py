@@ -88,8 +88,19 @@ def _compute_components(
 
     # Quantile-based bin edges (np.unique handles duplicate quantiles)
     bin_edges = np.unique(np.quantile(forecasts, np.linspace(0, 1, n_bins + 1)))
-    bin_idx = np.digitize(forecasts, bin_edges[1:], right=False)
-    n_actual_bins = len(bin_edges) - 1
+    n_actual_bins = max(len(bin_edges) - 1, 1)
+
+    # Degenerate case: every forecast is identical → np.unique collapses the
+    # edges to a single value and no bin would remain. We force one bin holding
+    # all n observations, so REL = (f̄ - ō)² is still accounted for.
+
+    # np.digitize assigns index == n_actual_bins to observations equal to the
+    # upper edge (bin_edges[-1] == max(forecasts), which always exists with
+    # quantile edges). Without the clip those rows fall outside the bin loop
+    # and are dropped from REL/RES/WBV/WBC while the divisor remains n — so the
+    # identity Br = REL − RES + UNC + WBV − 2·WBC no longer closes against the
+    # direct Brier score. See test_brier_identity_matches_direct_score.
+    bin_idx = np.clip(np.digitize(forecasts, bin_edges[1:], right=False), 0, n_actual_bins - 1)
 
     rel = res = wbv = wbc = 0.0
 
@@ -273,7 +284,8 @@ class IsotonicCalibrator:
     def predict(self, scores: np.ndarray) -> np.ndarray:
         if not self._fitted:
             raise RuntimeError("Call fit() first")
-        return self._ir.predict(np.asarray(scores, dtype=float))
+        predicted: np.ndarray = self._ir.predict(np.asarray(scores, dtype=float))
+        return predicted
 
 
 class BetaCalibrator:
@@ -309,7 +321,8 @@ class BetaCalibrator:
             raise RuntimeError("Call fit() first")
         scores = np.clip(np.asarray(scores, dtype=float), 1e-7, 1 - 1e-7)
         a, b, c = self._params
-        return expit(a * np.log(scores) + b * np.log(1.0 - scores) + c)
+        calibrated: np.ndarray = expit(a * np.log(scores) + b * np.log(1.0 - scores) + c)
+        return calibrated
 
 
 # ---------------------------------------------------------------------------
@@ -360,7 +373,7 @@ def recalibrate_out_of_time(
     all_weeks = np.sort(df["year_week"].unique())
     if len(all_weeks) <= weeks_fit:
         raise ValueError(
-            f"Need more than weeks_fit={weeks_fit} distinct weeks of data, " f"got {len(all_weeks)}"
+            f"Need more than weeks_fit={weeks_fit} distinct weeks of data, got {len(all_weeks)}"
         )
 
     rows = []

@@ -226,3 +226,57 @@ class TestRecalibrateOutOfTime:
         f, o, ts = self._make_data(20)
         with pytest.raises(ValueError, match="weeks_fit"):
             recalibrate_out_of_time(f, o, ts, method="isotonic", weeks_fit=10)
+
+
+# ---------------------------------------------------------------------------
+# Brier identity — regression test for the np.digitize off-by-one (MATH.md §8.1)
+# ---------------------------------------------------------------------------
+
+
+class TestBrierIdentity:
+    """
+    The five-term decomposition must reconstruct the direct Brier score.
+
+    Why this test exists:
+      `brier_decompose` returns `brier` computed AS the sum of its own
+      components, so the identity holds by construction and cannot detect a
+      binning error on its own. The only valid check is against
+      mean((f - o)^2) over the n observations.
+
+      Before v2.2, np.digitize assigned index n_bins to the observation with
+      the largest forecast (which always exists: bin_edges[-1] ==
+      max(forecasts) with quantile edges) and the loop only reached
+      n_bins - 1. That row was dropped from REL/RES/WBV/WBC while the divisor
+      remained n, and the identity stopped closing.
+    """
+
+    @staticmethod
+    def _sample(n: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
+        rng = np.random.default_rng(seed)
+        f = rng.uniform(0.02, 0.98, n)
+        o = (rng.uniform(size=n) < f).astype(float)
+        return f, o
+
+    @pytest.mark.parametrize(("n", "n_bins"), [(500, 10), (2000, 20), (137, 20), (60, 20)])
+    def test_brier_identity_matches_direct_score(self, n: int, n_bins: int) -> None:
+        f, o = self._sample(n, seed=n + n_bins)
+        bc = brier_decompose(f, o, n_bins=n_bins)
+        direct = float(np.mean((f - o) ** 2))
+        assert bc.brier == pytest.approx(direct, abs=1e-12)
+
+    def test_max_forecast_observation_is_not_dropped(self) -> None:
+        """The observation with the largest forecast must enter the decomposition."""
+        f, o = self._sample(400, seed=7)
+        f[0] = float(f.max())  # fuerza un empate en el borde superior
+        bc = brier_decompose(f, o, n_bins=10)
+        assert bc.n_obs == 400
+        assert bc.brier == pytest.approx(float(np.mean((f - o) ** 2)), abs=1e-12)
+
+    def test_identity_holds_with_constant_forecast(self) -> None:
+        """Degenerate case: a single bin. UNC dominates, REL and RES are 0."""
+        f = np.full(200, 0.37)
+        rng = np.random.default_rng(3)
+        o = (rng.uniform(size=200) < 0.37).astype(float)
+        bc = brier_decompose(f, o, n_bins=20)
+        assert bc.brier == pytest.approx(float(np.mean((f - o) ** 2)), abs=1e-12)
+        assert bc.wbv == pytest.approx(0.0, abs=1e-12)

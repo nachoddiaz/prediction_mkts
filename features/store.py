@@ -1,34 +1,34 @@
 """
 features/store.py
 ──────────────────
-Orquestador del feature store — conecta microstructure.py,
-resolution.py, el reader y el writer en un único punto de entrada.
+Feature store orchestrator — wires microstructure.py, resolution.py, the
+reader and the writer into a single entry point.
 
-Responsabilidades:
-  1. Recibir un market_id + snapshot/tick nuevo
-  2. Leer los datos necesarios de DuckDB (orderbook, ticks recientes)
-  3. Calcular todas las features (microestructura + resolución)
-  4. Persistir en la tabla features
+Responsibilities:
+  1. Receive a market_id plus a new snapshot/tick
+  2. Read what is needed from DuckDB (order book, recent ticks)
+  3. Compute every feature (microstructure + resolution)
+  4. Persist them into the features table
 
-Por qué este archivo y no llamar a microstructure directamente:
-  El feature store centraliza la lógica de "cuándo y cómo calcular".
-  El connector solo llama a store.on_tick() — no necesita saber
-  qué features existen ni cómo se calculan.
-  Si añades una nueva feature, solo tocas este archivo.
+Why this file rather than calling microstructure directly:
+  The feature store centralises the "when and how to compute" logic. The
+  connector only calls store.on_tick() — it needs to know neither which
+  features exist nor how they are computed. Adding a new feature means
+  touching this file only.
 
-Relación con el MATH.md:
-  Este archivo implementa el pipeline de §4.6:
+Relation to MATH.md:
+  This file implements the §4.6 pipeline:
     ticks → μ̂_t = w_1·OBI + w_2·News + w_3·OnChain
-  Por ahora μ̂_t = OBI (proxy) hasta calibrar w_i en notebooks.
+  For now μ̂_t = OBI (a proxy) until the w_i are calibrated in notebooks.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from features.microstructure import compute_features_from_db
-from normalizer.schema import Market, MarketSnapshot, Tick
+from normalizer.schema import Market, MarketSnapshot, OrderBook, Tick
 from storage.reader import MarketDataReader
 from storage.writer import MarketDataWriter
 
@@ -42,17 +42,17 @@ log = logging.getLogger(__name__)
 
 class FeatureStore:
     """
-    Calcula y persiste features para un conjunto de mercados activos.
+    Compute and persist features for a set of active markets.
 
-    Uso en producción (llamado por el connector, async):
+    Production use (called by the connector, async):
 
         store = FeatureStore(reader, writer)
 
-        # Cada vez que llega un tick o snapshot del WebSocket
+        # On every tick or snapshot from the stream
         await store.on_tick(tick, market)
         await store.on_snapshot(snapshot)
 
-    Uso en scripts/tests (síncrono):
+    Use from scripts and tests (synchronous):
 
         store = FeatureStore(reader, writer)
         store.compute_and_store(market_id, tau_years)
@@ -73,7 +73,7 @@ class FeatureStore:
         self._onchain_signal = onchain_signal
 
     # ------------------------------------------------------------------
-    # API principal — llamada por el connector
+    # Main API — called by the connector
     # ------------------------------------------------------------------
 
     def compute_and_store(
@@ -81,23 +81,25 @@ class FeatureStore:
         market_id: str,
         tau_years: float,
         ewma_window: int = 50,
+        orderbook: OrderBook | None = None,
+        tick: Tick | None = None,
     ) -> bool:
         """
-        Calcula todas las features para un mercado y las persiste.
+        Compute every feature for one market and persist them.
 
-        Por qué tau_years como parámetro externo:
-          tau lo calcula el connector desde market.resolution.tau,
-          que ya tiene la fecha de resolución. Pasarlo como parámetro
-          evita que el store tenga que hacer una query extra a markets.
+        Why tau_years is passed in from outside:
+          tau is computed by the connector from market.resolution.tau, which
+          already holds the resolution date. Passing it as a parameter saves
+          the store an extra query against the markets table.
 
         Args:
-            market_id:   string canónico "venue:raw_id"
-            tau_years:   tiempo hasta resolución en años
-            ewma_window: número de ticks para EWMA
+            market_id:   canonical "venue:raw_id" string
+            tau_years:   time to resolution, in years
+            ewma_window: number of ticks for the EWMA
 
         Returns:
-            True si se calcularon y persistieron features,
-            False si no había datos suficientes.
+            True if features were computed and persisted, False if there was
+            not enough data.
         """
         news_val = self._news_signal.get(market_id) if self._news_signal else 0.0
         onchain_val = (
@@ -112,6 +114,8 @@ class FeatureStore:
             ensemble=self._ensemble,
             news=news_val,
             onchain=onchain_val,
+            orderbook=orderbook,
+            tick=tick,
         )
 
         if row is None:
@@ -133,16 +137,16 @@ class FeatureStore:
         markets: list[Market],
     ) -> int:
         """
-        Calcula y persiste features para múltiples mercados.
+        Compute and persist features for several markets.
 
-        Usado por el connector al arrancar para procesar todos los
-        mercados activos de una vez antes de empezar el streaming.
+        Used by the connector at startup to process every active market
+        before streaming begins.
 
         Args:
-            markets: lista de objetos Market del dominio
+            markets: list of domain Market objects
 
         Returns:
-            Número de mercados con features persistidas exitosamente.
+            Number of markets whose features were persisted successfully.
         """
         rows = []
         for market in markets:
@@ -170,24 +174,25 @@ class FeatureStore:
         return len(rows)
 
     # ------------------------------------------------------------------
-    # Hooks para el connector — llamados en cada evento del WebSocket
+    # Connector hooks — invoked on each stream event
     # ------------------------------------------------------------------
 
     def on_tick(self, tick: Tick, market: Market) -> bool:
         """
-        Hook llamado por el connector cada vez que llega un tick.
+        Hook called by the connector on every incoming tick.
 
-        Por qué recalcular features en cada tick:
-          OBI y EWMA cambian con cada tick. El GLFT necesita features
-          actualizadas para calcular quotes correctos. La latencia
-          de cálculo es O(N) sobre ewma_window ticks — microsegundos.
+        Why recompute features on every tick:
+          OBI and the EWMA change with each tick, and GLFT needs current
+          features to produce correct quotes. The computation is O(N) over
+          ewma_window ticks — microseconds.
 
         Args:
-            tick:   tick nuevo que acaba de llegar del WebSocket
-            market: metadatos del mercado (para obtener tau)
+            tick:   the tick that just arrived from the stream
+            market: market metadata (to obtain tau)
 
         Returns:
-            True si features calculadas y persistidas, False si no hay datos.
+            True if features were computed and persisted, False if there was
+            no data.
         """
         return self.compute_and_store(
             market_id=str(market.market_id),
@@ -196,16 +201,16 @@ class FeatureStore:
 
     def on_snapshot(self, snapshot: MarketSnapshot) -> bool:
         """
-        Hook llamado por el connector cuando llega un snapshot completo
+        Hook called by the connector on a complete snapshot
         (market + orderbook + tick).
 
-        Por qué snapshot y no solo tick:
-          El snapshot incluye el orderbook — que es necesario para
-          calcular OBI con profundidad real en lugar del proxy de flujo.
-          Cuando hay snapshot disponible, las features son más precisas.
+        Why a snapshot and not just a tick:
+          The snapshot includes the order book, which is what allows OBI to be
+          computed from real depth rather than from a flow proxy. Where a
+          snapshot is available, the features are more accurate.
 
         Args:
-            snapshot: MarketSnapshot completo del connector
+            snapshot: the connector's complete MarketSnapshot
 
         Returns:
             True si features calculadas y persistidas.
@@ -213,25 +218,29 @@ class FeatureStore:
         if snapshot.last_tick is None:
             return False
 
+        # The book is passed IN HAND: re-reading it from DuckDB returned the
+        # previous snapshot — or none the first time — because the writer
         return self.compute_and_store(
             market_id=str(snapshot.market.market_id),
             tau_years=snapshot.market.resolution.tau,
+            orderbook=snapshot.orderbook,
+            tick=snapshot.last_tick,
         )
 
     # ------------------------------------------------------------------
-    # Consulta de features recientes — para el execution engine
+    # Recent feature lookup — for the execution engine
     # ------------------------------------------------------------------
 
-    def latest(self, market_id: str) -> dict | None:
+    def latest(self, market_id: str) -> dict[str, Any] | None:
         """
-        Devuelve las features más recientes de un mercado como dict.
+        Return a market's most recent features as a dict.
 
-        Usado por el execution engine antes de calcular quotes —
-        necesita OBI, belief_vol y tau_years en formato nativo
-        sin pasar por pandas.
+        Used by the execution engine before computing quotes: it needs OBI,
+        belief_vol and tau_years in native form, and a plain dict avoids going
+        through pandas on the hot path.
 
         Returns:
-            Dict con las features más recientes, None si no hay datos.
+            Dict of the most recent features, or None when there is no data.
         """
         df = self._reader.latest_features(market_id)
         if df.empty:

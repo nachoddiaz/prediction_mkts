@@ -36,18 +36,17 @@ dependencies = [
     "scipy>=1.13", # stats, optimization (usado en GLFT)
     # --- Fase 2: Models & signals ---
     "scikit-learn>=1.5", # isotonic regression, calibration
-    "lightgbm>=4.4", # ensemble signal model
-    "pymc>=5.16", # Bayesian updating (opcional, pesado)
-    # --- Fase 3-4: Strategies & execution ---
-    "py-clob-client>=0.18", # Polymarket CLOB official Python client
-    "eth-account>=0.13", # EIP-712 signing for Polymarket orders
-    "web3>=7.0", # Polygon RPC interaction
     # --- Observability ---
     "structlog>=24.0", # structured JSON logging
     "rich>=13.0", # pretty terminal output
     "pytz>=2026.1.post1",
-    "cryptography>=47.0.0",
+    "cryptography>=47.0.0", # Kalshi RSA signing
 ]
+
+# Note: lightgbm, pymc, web3, py-clob-client and eth-account were declared as
+# runtime dependencies but are imported nowhere in the tree (verified with
+# grep). pymc in particular drags in a full solver. They have moved to the
+# `models` and `live` extras, the phases that will actually need them.
 
 # ---------------------------------------------------------------------------
 # Optional dependency groups
@@ -71,27 +70,33 @@ research = [
     "ipywidgets>=8.1",
 ]
 
-dev = [
-    "pytest>=8.2",
-    "pytest-asyncio>=0.23",
-    "pytest-cov>=5.0",
-    "ruff>=0.5",
-    "mypy>=1.10",
-    "pre-commit>=3.7",
-    "ipython>=8.25",
+# Phase 2+ — heavy signal models. Nothing in the current tree imports them yet.
+models = [
+    "lightgbm>=4.4",  # ensemble signal model
+    "pymc>=5.16",     # Bayesian updating
+]
+
+# Phase 4 — live execution on Polymarket (on-chain).
+live = [
+    "py-clob-client>=0.18",  # Polymarket CLOB official Python client
+    "eth-account>=0.13",     # EIP-712 signing for Polymarket orders
+    "web3>=7.0",             # Polygon RPC interaction
 ]
 
 all = [
-    "prediction-market-system[dashboard,research,dev]",
+    "prediction-market-system[dashboard,research,models,live]",
 ]
 
 # ---------------------------------------------------------------------------
 # Entrypoints CLI
 # ---------------------------------------------------------------------------
+# The code lives in top-level packages (storage/, features/, ...), not under a
+# `prediction_market_system` package — which never existed. The three previous
+# entrypoints pointed at that phantom package and `pip install -e .` failed.
 [project.scripts]
-pms-ingest = "prediction_market_system.main:run_ingestion"
-pms-paper  = "prediction_market_system.main:run_paper_trading"
-pms-dash   = "prediction_market_system.dashboard.app:main"
+pms-ingest    = "main:main"
+pms-backtest  = "run_backtest:main"
+pms-calibrate = "run_calibration:main"
 
 # ---------------------------------------------------------------------------
 # Build backend
@@ -101,11 +106,21 @@ requires      = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["prediction_market_system"]
+packages = [
+    "backtesting",
+    "config",
+    "connectors",
+    "execution",
+    "features",
+    "normalizer",
+    "storage",
+    "strategies",
+]
 
 # ---------------------------------------------------------------------------
-# uv — dev dependencies declaradas aquí además de en optional-dependencies
-# para que `uv sync` las instale automáticamente en entorno de desarrollo
+# uv — the SINGLE declaration of the development dependencies.
+# They used to be duplicated here and in [project.optional-dependencies].dev,
+# which could silently diverge. `uv sync` installs this group by default.
 # ---------------------------------------------------------------------------
 [dependency-groups]
 dev = [
@@ -116,6 +131,10 @@ dev = [
     "mypy>=1.10",
     "pre-commit>=3.7",
     "ipython>=8.25",
+    # Documentation
+    "sphinx>=8.0",
+    "furo>=2024.1",
+    "sphinx-autobuild>=2024.4",
 ]
 
 # ---------------------------------------------------------------------------
@@ -133,15 +152,21 @@ select = [
     "I",   # isort
     "B",   # flake8-bugbear
     "UP",  # pyupgrade
-    "ANN", # flake8-annotations (type hints obligatorios)
+    "ANN", # flake8-annotations (type hints required)
 ]
 ignore = [
-    "ANN101",  # missing type for self
-    "ANN102",  # missing type for cls
+    # ANN101/ANN102 were removed from ruff; keeping them here only produces a
+    # warning on every run.
+    "UP042",  # `class X(str, Enum)` → `StrEnum`. Deferred on purpose:
+              # StrEnum changes the semantics of str(X.A) from "X.A" to "a",
+              # and those values end up in logs, DataFrame keys and comparisons
+              # in the backtest trace. That migration needs dedicated tests.
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"research/*" = ["ANN", "E501"]  # más permisivo en notebooks
+# Notebooks import per cell and annotate sparsely on purpose: they are
+# exploration notebooks, not production code.
+"research/*" = ["ANN", "E501", "E401", "E402", "E702", "I001", "B905"]
 "tests/*"    = ["ANN"]
 
 # ---------------------------------------------------------------------------
@@ -151,7 +176,11 @@ ignore = [
 python_version         = "3.12"
 strict                 = true
 ignore_missing_imports = true
-exclude                = ["research/", "tests/"]
+exclude                = ["research/", "tests/", "scratch/", "docs/"]
+# Without this, mypy aborts with "Source file found twice under different module
+# names" on the repository's flat layout and never checks anything.
+explicit_package_bases = true
+mypy_path              = "."
 
 # ---------------------------------------------------------------------------
 # Pytest
@@ -159,7 +188,10 @@ exclude                = ["research/", "tests/"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths    = ["tests"]
-addopts      = "--cov=storage --cov=normalizer --cov=features --cov-report=term-missing -q"
+# --cov does NOT belong here: forcing it in addopts instruments the whole tree
+# even when running a single test, multiplying iteration time by ~5. CI enables
+# it explicitly (see .github/workflows/ci.yml).
+addopts      = "-q --strict-markers"
 filterwarnings = [
     "ignore::DeprecationWarning",
 ]
@@ -171,10 +203,22 @@ markers = [
 # Coverage
 # ---------------------------------------------------------------------------
 [tool.coverage.run]
-source = ["storage", "normalizer", "features"]
+# It previously measured only storage/normalizer/features — that is, it excluded
+# exactly the modules that decide what is quoted and how much risk is taken.
+source = [
+    "backtesting",
+    "connectors",
+    "execution",
+    "features",
+    "normalizer",
+    "storage",
+    "strategies",
+]
 omit   = ["tests/*", "*/migrations/*", "scripts/*"]
 
 [tool.coverage.report]
 show_missing = true
 skip_covered = false
-fail_under   = 10
+# Raised from 10. It will keep rising as B2-B4 add execution and backtesting
+# tests; the stated target is 80 on the core modules.
+fail_under   = 75

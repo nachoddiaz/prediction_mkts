@@ -157,7 +157,7 @@ def run_database_calibration() -> None:
         print("\n  Available Markets in Local Database:")
         markets_list = markets_df.to_dict("records")
 
-        # Contar ticks y features por mercado, ordenar por más datos primero
+        # Count ticks and features per market, richest first
         for m in markets_list:
             mid = m["market_id"]
             m["_ticks"] = reader.count_ticks(mid)

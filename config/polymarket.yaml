@@ -1,12 +1,12 @@
 # config/polymarket.yaml
 # ───────────────────────
-# Parámetros del modelo y riesgo para Polymarket.
+# Model and risk parameters for Polymarket.
 #
 # Diferencias clave respecto a Kalshi:
-#   - Liquidación on-chain en Polygon (~2s latencia)
-#   - Sin límites CFTC — más volumen en ciertos mercados
+#   - On-chain settlement on Polygon (~2s latency)
+#   - No CFTC limits — more volume in certain markets
 #   - Mayor riesgo de contraparte (smart contracts) → q_max menor
-#   - κ típicamente mayor — CLOB más profundo
+#   - Typically higher κ — a deeper CLOB
 
 name: polymarket
 
@@ -15,29 +15,29 @@ active_categories:
   - politics
 
 max_markets: 30
-http_timeout: 15   # mayor timeout por latencia de Polygon
+http_timeout: 15   # a longer timeout, for Polygon latency
 
 risk:
-  # γ_I — CARA inventory risk aversion (separado de Kelly según v2.1)
-  # Ligeramente mayor por riesgo de smart contract
+  # γ_I — CARA inventory risk aversion (kept separate from Kelly, per v2.1)
+  # Slightly higher, for smart-contract risk
   gamma_I: 0.15
   q_max: 5
   max_daily_loss: 75.0
   max_position_loss: 15.0
 
-  # Coste de capital anualizado ρ_c — §8.1 MATH.md v2.1
+  # Annualised cost of capital ρ_c — §8.1 MATH.md v2.1
   capital_cost_rho: 0.07
 
   # b_U — USDC basis spread (solo Polymarket) — §8.2 MATH.md v2.1
   usdc_basis_bu: 0.001
 
-  # Tick size mínimo del spread en precio — §4.1 MATH.md v2.1
+  # Minimum spread tick size, in price space — §4.1 MATH.md v2.1
   tick_size: 0.01
 
 model:
-  # GLFT — κ típicamente mayor en Polymarket (libro más profundo)
+  # GLFT — κ is typically higher on Polymarket (a deeper book)
   kappa_p: 2.0
-  kappa_x: null  # se calcula desde kappa_p al calibrar
+  kappa_x: null  # derived from kappa_p on calibration
   A: 0.08
 
   # Cartea-Jaimungal
@@ -45,13 +45,13 @@ model:
   eta: 0.06
   rho: 0.12
 
-  # Nuevos parámetros v2.1
-  rho_mu: 0.5               # descuento de señal (§5)
+  # New v2.1 parameters
+  rho_mu: 0.5               # signal discount (§5)
   phi_kelly: 0.25           # Kelly fractional multiplier (§8)
   oracle_reversal_r: 0.001  # probabilidad reversal UMA (§8.1)
   tau_star_hours: 24.0      # escala temporal q_max (§8.3)
 
-  # Pesos señal
+  # Signal weights
   w_obi: 1.0
   w_news: 0.0
   w_onchain: 0.0

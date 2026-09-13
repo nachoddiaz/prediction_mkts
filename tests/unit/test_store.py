@@ -1,7 +1,7 @@
 """
 tests/unit/test_store.py
 ──────────────────────────
-Tests del FeatureStore.
+Tests for the FeatureStore.
 """
 
 from __future__ import annotations
@@ -99,7 +99,7 @@ def make_orderbook() -> OrderBook:
 
 
 def populate(db: DB, n_ticks: int = 20) -> None:
-    """Inserta market, orderbook y ticks en la DB."""
+    """Insert a market, an order book and ticks into the database."""
     db.w.write_market_sync(make_market())
     db.w.write_orderbook_sync(make_orderbook())
     base = NOW - timedelta(minutes=n_ticks)
@@ -125,7 +125,7 @@ def populate(db: DB, n_ticks: int = 20) -> None:
 
 
 class TestComputeAndStore:
-    def test_devuelve_true_con_datos(self) -> None:
+    def test_returns_true_with_data(self) -> None:
         db = DB()
         populate(db)
         tau = (RESOLUTION_DATE - NOW).total_seconds() / (365.25 * 24 * 3600)
@@ -133,13 +133,13 @@ class TestComputeAndStore:
         assert result is True
         db.close()
 
-    def test_devuelve_false_sin_datos(self) -> None:
+    def test_returns_false_without_data(self) -> None:
         db = DB()
         result = db.store.compute_and_store("kalshi:NO-EXISTE", 0.5)
         assert result is False
         db.close()
 
-    def test_persiste_en_tabla_features(self) -> None:
+    def test_persists_into_features_table(self) -> None:
         db = DB()
         populate(db)
         tau = (RESOLUTION_DATE - NOW).total_seconds() / (365.25 * 24 * 3600)
@@ -148,7 +148,7 @@ class TestComputeAndStore:
         assert count == 1
         db.close()
 
-    def test_features_tienen_tau_correcto(self) -> None:
+    def test_features_carry_correct_tau(self) -> None:
         db = DB()
         populate(db)
         tau = 0.19
@@ -164,17 +164,17 @@ class TestComputeAndStore:
 
 
 class TestBatch:
-    def test_batch_un_mercado(self) -> None:
+    def test_batch_single_market(self) -> None:
         db = DB()
         populate(db)
         n = db.store.compute_and_store_batch([make_market()])
         assert n == 1
         db.close()
 
-    def test_batch_excluye_sin_datos(self) -> None:
-        """Mercado sin ticks no genera features — no cuenta."""
+    def test_batch_excludes_markets_without_data(self) -> None:
+        """A market with no ticks generates no features — it does not count."""
         db = DB()
-        # Solo insertamos el market sin ticks
+        # Insert only the market, with no ticks
         db.w.write_market_sync(make_market())
         n = db.store.compute_and_store_batch([make_market()])
         assert n == 0
@@ -187,14 +187,14 @@ class TestBatch:
 
 
 class TestHooks:
-    def test_on_tick_con_datos(self) -> None:
+    def test_on_tick_with_data(self) -> None:
         db = DB()
         populate(db)
         result = db.store.on_tick(make_tick(), make_market())
         assert result is True
         db.close()
 
-    def test_on_snapshot_con_datos(self) -> None:
+    def test_on_snapshot_with_data(self) -> None:
         db = DB()
         populate(db)
         snapshot = MarketSnapshot(
@@ -206,8 +206,8 @@ class TestHooks:
         assert result is True
         db.close()
 
-    def test_on_snapshot_sin_tick_false(self) -> None:
-        """Snapshot sin last_tick no genera features."""
+    def test_on_snapshot_without_tick_is_false(self) -> None:
+        """A snapshot without last_tick generates no features."""
         db = DB()
         populate(db)
         snapshot = MarketSnapshot(
@@ -226,7 +226,7 @@ class TestHooks:
 
 
 class TestLatest:
-    def test_devuelve_dict_con_campos(self) -> None:
+    def test_returns_dict_with_fields(self) -> None:
         db = DB()
         populate(db)
         tau = (RESOLUTION_DATE - NOW).total_seconds() / (365.25 * 24 * 3600)
@@ -237,12 +237,12 @@ class TestLatest:
         assert required.issubset(features.keys())
         db.close()
 
-    def test_none_si_sin_features(self) -> None:
+    def test_none_when_no_features(self) -> None:
         db = DB()
         assert db.store.latest("kalshi:NO-EXISTE") is None
         db.close()
 
-    def test_valores_son_float(self) -> None:
+    def test_values_are_floats(self) -> None:
         db = DB()
         populate(db)
         tau = (RESOLUTION_DATE - NOW).total_seconds() / (365.25 * 24 * 3600)

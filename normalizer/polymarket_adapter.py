@@ -10,6 +10,7 @@ import json
 from datetime import UTC, datetime
 from typing import Any
 
+from normalizer.price_grid import parse_polymarket_tick_size
 from normalizer.schema import (
     Market,
     MarketCategory,
@@ -51,13 +52,13 @@ _POLY_TAG_MAP: dict[str, MarketCategory] = {
 
 def _parse_clob_token_ids(raw: dict[str, Any]) -> tuple[str, str] | None:
     """
-    Extrae los token IDs YES y NO del campo clobTokenIds.
+    Extract the YES and NO token IDs from the clobTokenIds field.
 
     La Gamma API devuelve clobTokenIds como string JSON, no como array:
       "clobTokenIds": "[\"13915...\", \"13290...\"]"
 
-    Necesitamos json.loads() para parsearlo.
-    Devuelve (yes_token_id, no_token_id) o None si no existe.
+    json.loads() is required to parse it.
+    Returns (yes_token_id, no_token_id), or None when absent.
     """
     raw_ids = raw.get("clobTokenIds")
     if not raw_ids:
@@ -71,7 +72,7 @@ def _parse_clob_token_ids(raw: dict[str, Any]) -> tuple[str, str] | None:
     return None
 
 
-def _infer_category_poly(tags: list[str] | list[dict]) -> MarketCategory:
+def _infer_category_poly(tags: list[str] | list[dict[str, Any]]) -> MarketCategory:
     for tag in tags:
         # Handle both string tags and dict tags with 'label' key
         tag_str = tag.lower() if isinstance(tag, str) else tag.get("label", "").lower()
@@ -81,19 +82,19 @@ def _infer_category_poly(tags: list[str] | list[dict]) -> MarketCategory:
 
 
 # ---------------------------------------------------------------------------
-# Parsing de timestamps
+# Timestamp parsing
 #
-# Por qué dos funciones separadas (_parse_ts_gamma y _parse_ts_clob):
-#   Gamma API y CLOB API usan formatos de timestamp distintos.
+# Why two separate functions (_parse_ts_gamma and _parse_ts_clob):
+#   The Gamma API and the CLOB API use different timestamp formats.
 # ---------------------------------------------------------------------------
 
 
 def _parse_ts_gamma(ts: int | str) -> datetime:
     if isinstance(ts, int | float):
-        # Unix milliseconds → segundos → datetime UTC
+        # Unix milliseconds → seconds → UTC datetime
         return datetime.fromtimestamp(ts / 1000.0, tz=UTC)
 
-    # Fallback: ISO string (algunos endpoints de Gamma usan esto)
+    # Fallback: ISO string (some Gamma endpoints use this)
     ts_str = str(ts).rstrip("Z")
     for fmt in ("%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S"):
         try:
@@ -116,36 +117,36 @@ def _parse_ts_clob(ts: str) -> datetime:
 
 
 # ---------------------------------------------------------------------------
-# Market adapter — desde Gamma API
+# Market adapter — from the Gamma API
 # ---------------------------------------------------------------------------
 
 
 def polymarket_market_to_domain(raw: dict[str, Any]) -> Market:
     """
-    Convierte un objeto market de la Gamma API al dominio canónico.
+    Convert a Gamma API market object into the canonical domain.
 
-    Lógica de status — por qué este orden de prioridad:
-      Comprobamos "resolved" primero porque un mercado puede tener
-      resolved=True y closed=True simultáneamente. Si comprobáramos
-      closed primero, perderíamos la información de resolución.
+    Status logic — why this priority order:
+      "resolved" is checked first because a market can carry resolved=True and
+      closed=True simultaneously. Checking closed first would lose the
+      resolution information.
 
-    Lógica de resolved_value:
-      Después de resolución, el token ganador tiene price ≈ 1.0
-      y el perdedor price ≈ 0.0. Usamos >= 0.99 en lugar de == 1.0
-      porque Polymarket puede devolver 0.9999... por precisión
-      de punto flotante en el contrato ERC-1155.
+    resolved_value logic:
+      After resolution the winning token has price ≈ 1.0 and the loser
+      price ≈ 0.0. We use >= 0.99 rather than == 1.0 because Polymarket may
+      return 0.9999... for floating-point reasons inside the ERC-1155
+      contract.
 
     Args:
-        raw: dict con la respuesta de Gamma API GET /markets
+        raw: dict holding the Gamma API GET /markets response
 
     Raises:
-        ValueError: si falta end_date (requerido para calcular τ)
+        ValueError: when end_date is missing (required to compute τ)
     """
     condition_id: str = raw.get("conditionId") or raw.get("condition_id") or raw["id"]
     market_id = MarketId(venue=Venue.POLYMARKET, raw_id=condition_id)
 
     # --- Status ---
-    # Orden de comprobación importante: resolved > closed > active
+    # The check order matters: resolved > closed > active
     if raw.get("resolved", False):
         status = MarketStatus.RESOLVED
     elif raw.get("closed", False):
@@ -160,14 +161,14 @@ def polymarket_market_to_domain(raw: dict[str, Any]) -> Market:
         raise ValueError(f"Market {condition_id} has no end_date")
     resolution_date = _parse_ts_gamma(end_date_raw)
 
-    # El token YES con price >= 0.99 indica que YES ganó.
+    # A YES token priced >= 0.99 indicates YES won.
     resolved_value: float | None = None
     if status == MarketStatus.RESOLVED:
-        tokens: list[dict] = raw.get("tokens", [])
+        tokens: list[dict[str, Any]] = raw.get("tokens", [])
         for token in tokens:
             if token.get("outcome", "").lower() == "yes":
                 price = float(token.get("price", 0.0))
-                # >= 0.99 en lugar de == 1.0 por precisión floating point
+                # >= 0.99 rather than == 1.0, for floating-point precision
                 resolved_value = 1.0 if price >= 0.99 else 0.0
                 break
 
@@ -180,12 +181,66 @@ def polymarket_market_to_domain(raw: dict[str, Any]) -> Market:
             resolved_value=resolved_value,
         ),
         status=status,
+        # Polymarket declares `orderPriceMinTickSize` in Gamma and
+        # `minimum_tick_size` in the CLOB. Both are 0.001 today; we read
+        # whichever the payload carries rather than hard-coding it.
+        price_ladder=parse_polymarket_tick_size(
+            raw.get("orderPriceMinTickSize") or raw.get("minimum_tick_size")
+        ),
     )
 
 
 # ---------------------------------------------------------------------------
-# OrderBook adapter — desde CLOB API
+# OrderBook adapter — from the CLOB API
 # ---------------------------------------------------------------------------
+
+
+def polymarket_merged_book_to_domain(
+    market_id: MarketId,
+    yes_book: dict[str, Any],
+    no_book: dict[str, Any] | None,
+    timestamp: datetime | None = None,
+) -> OrderBook:
+    """
+    Merge the YES-token and NO-token books into a single YES book.
+
+    Why merging is necessary:
+      On Polymarket, YES and NO are two distinct ERC-1155 tokens with SEPARATE
+      BOOKS. Looking only at the YES book, markets appear with 92 bids and 0
+      asks — not because nobody wants to sell YES, but because that liquidity
+      is expressed as NO bids. Without merging, those markets were discarded
+      entirely: 4 out of every 6 in the volume-ranked sample.
+
+    The equivalence is the same one the Kalshi adapter already applies:
+        buying NO at p_no   ≡  selling YES at (1 - p_no)
+        selling NO at p_no  ≡  buying YES at (1 - p_no)
+
+    Args:
+        yes_book: /book payload for the YES token
+        no_book:  /book payload for the NO token. None = use the YES book only.
+    """
+    ts = timestamp or datetime.now(tz=UTC)
+
+    def levels(raw: list[dict[str, Any]], complement: bool) -> list[dict[str, Any]]:
+        out = []
+        for lv in raw:
+            try:
+                price = float(lv["price"])
+                size = float(lv["size"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if size <= 0:
+                continue
+            out.append({"price": 1.0 - price if complement else price, "size": size})
+        return out
+
+    merged = {
+        "bids": levels(yes_book.get("bids", []), complement=False)
+        + levels((no_book or {}).get("asks", []), complement=True),
+        "asks": levels(yes_book.get("asks", []), complement=False)
+        + levels((no_book or {}).get("bids", []), complement=True),
+    }
+    return polymarket_orderbook_to_domain(market_id, merged, ts)
 
 
 def polymarket_orderbook_to_domain(
@@ -194,28 +249,28 @@ def polymarket_orderbook_to_domain(
     timestamp: datetime | None = None,
 ) -> OrderBook:
     """
-    Convierte la respuesta de GET /book del CLOB al dominio canónico.
+    Convert the CLOB GET /book response into the canonical domain.
 
-    Formato del CLOB (precios ya en [0,1], no en centavos):
+    CLOB format (prices already in [0,1], not cents):
       {
         "bids": [{"price": "0.45", "size": "100"}, ...],
         "asks": [{"price": "0.47", "size": "150"}, ...]
       }
 
-    La CLOB API devuelve precios como strings ("0.45"), no como
+    The CLOB API returns prices as strings ("0.45"), not as numbers, so each
     floats.
 
     Args:
         market_id: MarketId ya construido
-        raw: respuesta de GET /book del CLOB
+        raw: CLOB GET /book response
         timestamp: si None, usa datetime.now(UTC)
     """
     ts = timestamp or datetime.now(tz=UTC)
 
-    raw_bids: list[dict] = raw.get("bids", [])
-    raw_asks: list[dict] = raw.get("asks", [])
+    raw_bids: list[dict[str, Any]] = raw.get("bids", [])
+    raw_asks: list[dict[str, Any]] = raw.get("asks", [])
 
-    # Construir bids — filtramos size == 0 (niveles vacíos)
+    # Build the bids — size == 0 levels (empty ones) are filtered out
     bids: list[OrderBookLevel] = [
         OrderBookLevel(
             price=Price(round(float(lv["price"]), 6)),
@@ -225,7 +280,7 @@ def polymarket_orderbook_to_domain(
         if float(lv.get("size", 0)) > 0
     ]
 
-    # Construir asks — mismo tratamiento que bids
+    # Build asks — same treatment as bids
     asks: list[OrderBookLevel] = [
         OrderBookLevel(
             price=Price(round(float(lv["price"]), 6)),
@@ -239,7 +294,7 @@ def polymarket_orderbook_to_domain(
     bids.sort(key=lambda lv: lv.price, reverse=True)
     asks.sort(key=lambda lv: lv.price)
 
-    # Filtrar niveles cruzados — misma lógica que Kalshi
+    # Filter crossed levels — same logic as Kalshi
     if bids and asks:
         best_bid = bids[0].price
         best_ask = asks[0].price
@@ -265,21 +320,21 @@ def polymarket_trade_to_tick(
     raw: dict[str, Any],
 ) -> Tick:
     """
-    Convierte un evento de trade del CLOB a un Tick canónico.
+    Convert a CLOB trade event into a canonical Tick.
 
-    Formato del trade en el CLOB REST y WebSocket:
+    Trade format in both the CLOB REST and WebSocket feeds:
       {
-        "price":     "0.46",          ← precio de ejecución en [0,1]
-        "size":      "50",            ← contratos ejecutados
-        "side":      "BUY",           ← BUY=compró YES, SELL=vendió YES
+        "price":     "0.46",          ← execution price in [0,1]
+        "size":      "50",            ← contracts executed
+        "side":      "BUY",           ← BUY = bought YES, SELL = sold YES
         "timestamp": "2024-12-31T12:00:00Z"
       }
 
-    Por qué "BUY" → Side.YES y "SELL" → Side.NO
+    Hence "BUY" → Side.YES and "SELL" → Side.NO.
 
     Args:
-        market_id: MarketId ya construido
-        raw: evento de trade del CLOB
+        market_id: an already-built MarketId
+        raw: CLOB trade event
     """
     price = Price(round(float(raw["price"]), 6))
 
@@ -293,7 +348,7 @@ def polymarket_trade_to_tick(
         market_id=market_id,
         timestamp=ts,
         tick_type=TickType.TRADE,
-        # bid == ask == precio de ejecución en trades
+        # bid == ask == execution price on trades
         yes_bid=price,
         yes_ask=price,
         volume=Size(float(raw.get("size", 0))),
@@ -306,10 +361,10 @@ def polymarket_quote_to_tick(
     orderbook: OrderBook,
 ) -> Tick | None:
     """
-    Deriva un QUOTE tick desde un snapshot de OrderBook de Polymarket.
+    Derive a QUOTE tick from a Polymarket OrderBook snapshot.
 
     Returns:
-        Tick de tipo QUOTE, o None si el libro está incompleto
+        A QUOTE Tick, or None when the book is incomplete
     """
     if orderbook.best_bid is None or orderbook.best_ask is None:
         return None
@@ -320,8 +375,8 @@ def polymarket_quote_to_tick(
         tick_type=TickType.QUOTE,
         yes_bid=orderbook.best_bid,
         yes_ask=orderbook.best_ask,
-        volume=Size(0.0),  # sin trade, sin volumen
-        side=None,  # sin agresión, sin side
+        volume=Size(0.0),  # no trade, no volume
+        side=None,  # no aggressor, no side
     )
 
 
@@ -330,44 +385,44 @@ def polymarket_price_update_to_tick(
     raw: dict[str, Any],
 ) -> Tick | None:
     """
-    Convierte un mensaje de price_change del WebSocket del CLOB a un Tick.
+    Convert a CLOB WebSocket price_change message into a Tick.
 
-    Polymarket emite estos mensajes cuando el mid-price cambia
-    sin que haya un trade completo.
+    Polymarket emits these when the mid price moves without a completed
+    trade.
 
-    Formato del mensaje WS:
+    WS message format:
       {
-        "asset_id":  "...",       ← token_id del contrato YES
-        "price":     "0.46",      ← nuevo mid-price
+        "asset_id":  "...",       ← token_id of the YES contract
+        "price":     "0.46",      ← the new mid price
         "side":      "BUY",
-        "size":      "0",         ← 0 porque no hay fill
+        "size":      "0",         ← 0 because there is no fill
         "timestamp": 1704067200000  ← Unix ms
       }
 
     Args:
         market_id: MarketId ya construido
-        raw: mensaje raw del WebSocket del CLOB
+        raw: raw CLOB WebSocket message
 
     Returns:
-        Tick de tipo QUOTE, o None si el mensaje no tiene precio
+        A QUOTE Tick, or None when the message carries no price
     """
     price_str = raw.get("price")
     if price_str is None:
-        # Mensaje sin precio — heartbeat o mensaje de status
+        # Message without a price — heartbeat or status message
         return None
 
     price = Price(round(float(price_str), 6))
 
-    # El timestamp puede venir como Unix ms (int) o ISO string
+    # The timestamp can arrive as Unix ms (int) or as an ISO string
     ts_raw = raw.get("timestamp")
     if isinstance(ts_raw, int | float):
         ts = datetime.fromtimestamp(ts_raw / 1000.0, tz=UTC)
     else:
         ts = datetime.now(tz=UTC)
 
-    # Para price updates, bid ≈ ask ≈ precio (aproximación)
-    # No tenemos profundidad del libro en este mensaje,
-    # solo el mid-price. El feature store lo trata como QUOTE.
+    # For price updates, bid ≈ ask ≈ price (an approximation).
+    # This message carries no book depth, so the spread cannot be recovered —
+    # only the mid price. The feature store treats it as a QUOTE.
     return Tick(
         market_id=market_id,
         timestamp=ts,
@@ -380,7 +435,7 @@ def polymarket_price_update_to_tick(
 
 
 # ---------------------------------------------------------------------------
-# Convenience: snapshot completo desde respuestas REST
+# Convenience: full snapshot from REST responses
 # ---------------------------------------------------------------------------
 
 
@@ -390,18 +445,18 @@ def polymarket_to_snapshot(
     timestamp: datetime | None = None,
 ) -> MarketSnapshot:
     """
-    Construye un MarketSnapshot completo desde respuestas de las APIs REST.
+    Build a complete MarketSnapshot from the REST API responses.
 
-    raw_market viene de Gamma y raw_orderbook del CLOB
+    raw_market comes from Gamma and raw_orderbook from the CLOB.
 
-    Flujo idéntico al de kalshi_to_snapshot:
-      raw_market    → Market (metadatos desde Gamma)
-      raw_orderbook → OrderBook (libro desde CLOB)
-      OrderBook     → Tick de tipo QUOTE (último precio)
+    The flow is identical to kalshi_to_snapshot:
+      raw_market    → Market (metadata from Gamma)
+      raw_orderbook → OrderBook (book from the CLOB)
+      OrderBook     → QUOTE Tick (latest price)
 
     Args:
         raw_market: respuesta de Gamma API GET /markets
-        raw_orderbook: respuesta de CLOB API GET /book (opcional)
+        raw_orderbook: the CLOB API GET /book response (optional)
         timestamp: si None, usa datetime.now(UTC)
     """
     market = polymarket_market_to_domain(raw_market)

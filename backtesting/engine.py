@@ -1,7 +1,7 @@
 """
 backtesting/engine.py
 ─────────────────────
-Motor de backtesting histórico síncrono para estrategias de market-making.
+Synchronous historical backtesting engine for market-making strategies.
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ from execution.risk.limits import RiskLimitsChecker
 from execution.risk.monitor import RiskMonitor
 from execution.router import OrderRouter
 from features.resolution import compute_resolution_features
+from normalizer.price_grid import ladder_for_venue
 from normalizer.schema import (
     Market,
     MarketCategory,
@@ -34,19 +35,26 @@ from normalizer.schema import (
     TickType,
 )
 from storage.reader import MarketDataReader
-from strategies.market_making.cartea_jaimungal import CarteaJaimungalQuoter
-from strategies.market_making.glft import GLFTQuoter
+from strategies.market_making.cartea_jaimungal import (
+    DEFAULT_RHO_MU,
+    CarteaJaimungalQuoter,
+)
+from strategies.market_making.glft import (
+    DEFAULT_GAMMA_I,
+    DEFAULT_KAPPA_X,
+    GLFTQuoter,
+)
 
 log = logging.getLogger(__name__)
 
 
 class BacktestEngine:
     """
-    Ejecuta simulaciones de backtesting histórico para estrategias.
+    Runs historical backtest simulations for a strategy.
 
-    Carga ticks y features de forma síncrona desde DuckDB, realiza el
-    emparejamiento temporal (merge_asof), y corre paso a paso
-    reutilizando las clases de Paper Trading y Risk Management.
+    Loads ticks and features synchronously from DuckDB, aligns them in time
+    (merge_asof) and runs step by step, reusing the paper trading and risk
+    management classes.
     """
 
     def __init__(
@@ -63,15 +71,15 @@ class BacktestEngine:
     ) -> None:
         """
         Args:
-            db_path:         Ruta al archivo DuckDB
-            market_id:       ID del mercado a evaluar (ej. 'manifold:xyz')
-            strategy_name:   Nombre de la estrategia ('glft' o 'cartea_jaimungal')
-            strategy_params: Parámetros del quoter de la estrategia
-            start:           Fecha de inicio del backtest
-            end:             Fecha de fin del backtest
-            initial_cash:    Capital inicial en dólares
-            order_size:      Tamaño de los quotes (default 1 contract)
-            risk_params:     Configuración de riesgo (limites, circuit breaker)
+            db_path:         path to the DuckDB file
+            market_id:       market to evaluate (e.g. 'manifold:xyz')
+            strategy_name:   strategy name ('glft' or 'cartea_jaimungal')
+            strategy_params: quoter parameters for the strategy
+            start:           backtest start date
+            end:             backtest end date
+            initial_cash:    starting capital, in dollars
+            order_size:      quote size (default 1 contract)
+            risk_params:     risk configuration (limits, circuit breaker)
         """
         self.db_path = db_path
         self.market_id = market_id
@@ -88,18 +96,18 @@ class BacktestEngine:
 
     def run(self) -> tuple[dict[str, Any], pd.DataFrame]:
         """
-        Ejecuta el backtest y calcula las métricas.
+        Run the backtest and compute the metrics.
 
         Returns:
-            Tuple con:
-              - Dict[str, Any] conteniendo las métricas cuantitativas
-              - pd.DataFrame con la traza detallada del backtest
+            A tuple of:
+              - Dict[str, Any] holding the quantitative metrics
+              - pd.DataFrame holding the detailed backtest trace
         """
         market_id_obj = MarketId.from_str(self.market_id)
 
-        # 1. Conectar a base de datos y leer información
+        # 1. Connect to the database and read the data
         with MarketDataReader(self.db_path) as reader:
-            # Leer metadatos del mercado
+            # Read the market metadata
             market_df = reader.market(self.market_id)
             if not market_df.empty:
                 row = market_df.iloc[0]
@@ -119,7 +127,7 @@ class BacktestEngine:
                     status=MarketStatus(row["status"]),
                 )
             else:
-                # Fallback predeterminado para tests o mercados inexistentes
+                # Default fallback for tests or unknown markets
                 res_date = datetime.now(tz=UTC) + timedelta(days=30)
                 market = Market(
                     market_id=market_id_obj,
@@ -133,18 +141,18 @@ class BacktestEngine:
             ticks_df = reader.ticks(self.market_id, start=self.start, end=self.end)
             features_df = reader.features(self.market_id, start=self.start, end=self.end)
 
-        # Si no hay datos, retornar estructura vacía
+        # With no data, return an empty structure
         if ticks_df.empty:
             log.warning("No ticks found for market %s in range. Backtest aborted.", self.market_id)
             return calculate_metrics(pd.DataFrame(), self.initial_cash), pd.DataFrame()
 
-        # 2. Ordenar y alinear ticks y features temporalmente
+        # 2. Sort and time-align ticks and features
         ticks_df["timestamp"] = pd.to_datetime(ticks_df["timestamp"])
         features_df["timestamp"] = pd.to_datetime(features_df["timestamp"])
         ticks_df = ticks_df.sort_values("timestamp")
         features_df = features_df.sort_values("timestamp")
 
-        # merge_asof para alinear los ticks con la feature más reciente en t
+        # merge_asof aligns each tick with the most recent feature at t
         merged_df = pd.merge_asof(
             ticks_df,
             features_df,
@@ -152,27 +160,28 @@ class BacktestEngine:
             direction="backward",
         )
 
-        # Rellenar valores nulos de features si los hay (e.g. antes de la primera feature)
+        # Fill any null feature values (e.g. before the first feature)
         merged_df = merged_df.ffill().bfill()
 
         # 3. Inicializar Estrategia Quoter
+        quoter: GLFTQuoter | CarteaJaimungalQuoter
         if self.strategy_name == "glft":
             quoter = GLFTQuoter(
-                gamma_I=self.strategy_params.get("gamma_I", 0.1),
-                kappa_x=self.strategy_params.get("kappa_x", 0.8),
+                gamma_I=self.strategy_params.get("gamma_I", DEFAULT_GAMMA_I),
+                kappa_x=self.strategy_params.get("kappa_x", DEFAULT_KAPPA_X),
             )
         elif self.strategy_name == "cartea_jaimungal":
             quoter = CarteaJaimungalQuoter(
-                gamma_I=self.strategy_params.get("gamma_I", 0.1),
-                kappa_x=self.strategy_params.get("kappa_x", 0.8),
+                gamma_I=self.strategy_params.get("gamma_I", DEFAULT_GAMMA_I),
+                kappa_x=self.strategy_params.get("kappa_x", DEFAULT_KAPPA_X),
                 phi=self.strategy_params.get("phi", 1.0),
                 eta=self.strategy_params.get("eta", 0.05),
-                rho=self.strategy_params.get("rho", 0.0),
+                rho=self.strategy_params.get("rho", DEFAULT_RHO_MU),
             )
         else:
             raise ValueError(f"Unknown strategy name: {self.strategy_name}")
 
-        # 4. Inicializar Componentes de Simulación de Ejecución y Riesgo
+        # 4. Initialise the execution simulation and risk components
         account = PaperAccount(initial_cash=self.initial_cash)
         execution_engine = PaperExecutionEngine(account)
 
@@ -191,9 +200,13 @@ class BacktestEngine:
             q_max_base=self.risk_params.get("q_max_base", 100.0),
         )
 
+        # The market's price grid: the one carried on Market when the venue
+        # publishes it per market (Kalshi does), otherwise the venue default.
+        ladder = market.price_ladder or ladder_for_venue(market_id_obj.venue)
+
         trace_records = []
 
-        # 5. Loop de Simulación Histórica
+        # 5. Historical simulation loop
         for _, row in merged_df.iterrows():
             ts = row["timestamp"]
             if ts.tzinfo is None:
@@ -219,17 +232,17 @@ class BacktestEngine:
             tau_years = float(row.get("tau_years", 1.0))
             mu_hat = float(row.get("mu_hat", 0.0))
 
-            # Resolver régimen near-resolution
+            # Resolve the near-resolution regime
             resolution_feats = compute_resolution_features(
                 market.resolution.resolution_date,
                 now=ts,
             )
             regime = resolution_feats.regime
 
-            # Generar cotización de la estrategia
+            # Generate the strategy's quote
             current_position = account.get_position(market_id_obj)
 
-            if self.strategy_name == "glft":
+            if isinstance(quoter, GLFTQuoter):
                 quote = quoter.quote(
                     market_id=market_id_obj,
                     mid_p=tick.mid,
@@ -238,6 +251,7 @@ class BacktestEngine:
                     belief_vol=belief_vol,
                     regime=regime,
                     timestamp=ts,
+                    ladder=ladder,
                 )
             else:  # cartea_jaimungal
                 quote = quoter.quote(
@@ -249,19 +263,20 @@ class BacktestEngine:
                     regime=regime,
                     mu_hat=mu_hat,
                     timestamp=ts,
+                    ladder=ladder,
                 )
 
-            # Enrutamiento de órdenes óptimas (ajustar las limit orders en el book)
+            # Route the optimal orders (adjust the resting limit orders)
             router.on_quote(
                 quote=quote,
                 size=self.order_size,
                 market=market,
             )
 
-            # Simular emparejamiento contra el tick actual
+            # Simulate matching against the current tick
             filled_orders = execution_engine.process_tick(tick)
 
-            # Registrar snapshots del estado finalizado en t
+            # Record a snapshot of the finalised state at t
             equity = account.cash_balance + current_position * tick.mid
 
             if filled_orders:
@@ -298,7 +313,7 @@ class BacktestEngine:
                     }
                 )
 
-        # 6. Compilar DataFrame final y calcular métricas globales
+        # 6. Assemble the final DataFrame and compute the global metrics
         trace_df = pd.DataFrame(trace_records)
         metrics = calculate_metrics(trace_df, self.initial_cash)
 

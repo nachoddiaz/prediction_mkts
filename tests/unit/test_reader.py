@@ -1,8 +1,8 @@
 """
 tests/unit/test_reader.py
-Tests del MarketDataReader.
-Usa writer síncrono para poblar DuckDB :memory: y luego verifica
-que el reader lee correctamente lo que el writer escribió.
+Tests for MarketDataReader.
+Uses the synchronous writer to populate an in-memory DuckDB, then verifies
+the reader reads back exactly what the writer wrote.
 """
 
 from __future__ import annotations
@@ -34,20 +34,20 @@ from storage.reader import MarketDataReader
 from storage.writer import MarketDataWriter
 
 # ---------------------------------------------------------------------------
-# Fixture: base de datos en memoria compartida entre writer y reader
+# Fixture: an in-memory database shared between writer and reader
 # ---------------------------------------------------------------------------
 
 
 class DB:
     """
-    Writer y reader apuntando a la misma base de datos :memory:.
-    DuckDB en modo :memory: no se puede compartir entre conexiones distintas
-    así que usamos la conexión interna del writer directamente.
+    Writer and reader pointing at the same :memory: database.
+    DuckDB in :memory: mode cannot be shared across separate connections,
+    so we use the writer's internal connection directly.
     """
 
     def __init__(self) -> None:
         self.w = MarketDataWriter(db_path=":memory:")
-        # El reader usa la misma conexión interna del writer
+        # The reader shares the writer's internal connection
         self.r = MarketDataReader.__new__(MarketDataReader)
         self.r._con = self.w._con
 
@@ -119,12 +119,12 @@ def make_ob(mid: MarketId | None = None) -> OrderBook:
 
 
 # ---------------------------------------------------------------------------
-# Tests sección operacional
+# Operational-section tests
 # ---------------------------------------------------------------------------
 
 
 class TestOperacional:
-    def test_latest_ticks_devuelve_n(self) -> None:
+    def test_latest_ticks_returns_n(self) -> None:
         db = make_db()
         ticks = [make_tick(bid=0.44, ask=0.46) for i in range(10)]
         db.w.write_ticks_sync(ticks)
@@ -132,8 +132,8 @@ class TestOperacional:
         assert len(df) == 5
         db.close()
 
-    def test_latest_ticks_orden_desc(self) -> None:
-        """Los ticks más recientes primero."""
+    def test_latest_ticks_ordered_desc(self) -> None:
+        """The most recent ticks come first."""
         db = make_db()
         base = datetime(2026, 4, 22, 12, 0, tzinfo=UTC)
         ticks = [make_tick(ts=base + timedelta(seconds=i)) for i in range(5)]
@@ -144,7 +144,7 @@ class TestOperacional:
         db.close()
 
     def test_latest_ticks_market_id_filtrado(self) -> None:
-        """Solo devuelve ticks del market_id solicitado."""
+        """Only ticks for the requested market_id are returned."""
         db = make_db()
         k_id = make_mid(Venue.KALSHI, "KXBTC-TEST")
         p_id = make_mid(Venue.POLYMARKET, "0xabc123")
@@ -162,7 +162,7 @@ class TestOperacional:
         assert df["best_ask"].iloc[0] == pytest.approx(0.47)
         db.close()
 
-    def test_latest_orderbook_vacio_si_no_existe(self) -> None:
+    def test_latest_orderbook_empty_when_absent(self) -> None:
         db = make_db()
         df = db.r.latest_orderbook("kalshi:NO-EXISTE")
         assert len(df) == 0
@@ -190,7 +190,7 @@ class TestOperacional:
         assert df["obi"].iloc[0] == pytest.approx(0.3)
         db.close()
 
-    def test_market_por_id(self) -> None:
+    def test_market_by_id(self) -> None:
         db = make_db()
         db.w.write_market_sync(make_market())
         df = db.r.market("kalshi:KXBTC-TEST")
@@ -226,19 +226,19 @@ class TestOperacional:
         assert mid == pytest.approx(0.45)
         db.close()
 
-    def test_mid_price_now_none_si_vacio(self) -> None:
+    def test_mid_price_now_none_when_empty(self) -> None:
         db = make_db()
         assert db.r.mid_price_now("kalshi:NO-EXISTE") is None
         db.close()
 
 
 # ---------------------------------------------------------------------------
-# Tests sección analítica
+# Analytical-section tests
 # ---------------------------------------------------------------------------
 
 
 class TestAnalitica:
-    def test_ticks_filtro_temporal(self) -> None:
+    def test_ticks_time_filter(self) -> None:
         db = make_db()
         base = datetime(2026, 4, 22, 10, 0, tzinfo=UTC)
         ticks = [make_tick(ts=base + timedelta(hours=i)) for i in range(5)]
@@ -250,7 +250,7 @@ class TestAnalitica:
         assert len(df) == 3
         db.close()
 
-    def test_ticks_filtro_tipo(self) -> None:
+    def test_ticks_type_filter(self) -> None:
         db = make_db()
         db.w.write_ticks_sync(
             [
@@ -303,7 +303,7 @@ class TestAnalitica:
     def test_daily_volume(self) -> None:
         db = make_db()
         base = datetime(2026, 4, 22, 12, 0, tzinfo=UTC)
-        # 3 trades en el mismo día
+        # 3 trades on the same day
         trades = [
             make_tick(ts=base + timedelta(hours=i), tick_type=TickType.TRADE, side=Side.YES)
             for i in range(3)
@@ -338,13 +338,13 @@ class TestAnalitica:
 
 
 # ---------------------------------------------------------------------------
-# Tests sección backtesting
+# Backtesting-section tests
 # ---------------------------------------------------------------------------
 
 
 class TestBacktesting:
-    def test_ticks_chunked_todos_los_ticks(self) -> None:
-        """El generador devuelve todos los ticks, ninguno se pierde."""
+    def test_ticks_chunked_yields_every_tick(self) -> None:
+        """The generator yields every tick; none is lost."""
         db = make_db()
         ticks = [make_tick(bid=0.40 + i * 0.001) for i in range(25)]
         db.w.write_ticks_sync(ticks)
@@ -353,8 +353,8 @@ class TestBacktesting:
         assert total == 25
         db.close()
 
-    def test_ticks_chunked_tamano_correcto(self) -> None:
-        """Cada chunk tiene exactamente chunk_size filas (excepto el último)."""
+    def test_ticks_chunked_correct_size(self) -> None:
+        """Every chunk holds exactly chunk_size rows, except the last."""
         db = make_db()
         ticks = [make_tick() for _ in range(25)]
         db.w.write_ticks_sync(ticks)
@@ -366,8 +366,8 @@ class TestBacktesting:
         assert len(chunks[2]) == 5
         db.close()
 
-    def test_ticks_chunked_orden_asc(self) -> None:
-        """El generador devuelve ticks en orden cronológico ascendente."""
+    def test_ticks_chunked_ordered_asc(self) -> None:
+        """The generator yields ticks in ascending chronological order."""
         db = make_db()
         base = datetime(2026, 4, 22, 12, 0, tzinfo=UTC)
         ticks = [make_tick(ts=base + timedelta(seconds=i)) for i in range(10)]
@@ -380,7 +380,7 @@ class TestBacktesting:
         assert all_ts == sorted(all_ts)
         db.close()
 
-    def test_ticks_chunked_filtro_temporal(self) -> None:
+    def test_ticks_chunked_time_filter(self) -> None:
         db = make_db()
         base = datetime(2026, 4, 22, 10, 0, tzinfo=UTC)
         ticks = [make_tick(ts=base + timedelta(hours=i)) for i in range(6)]
@@ -394,8 +394,8 @@ class TestBacktesting:
         assert total == 4
         db.close()
 
-    def test_ticks_chunked_vacio(self) -> None:
-        """Sin ticks el generador no produce ningún chunk."""
+    def test_ticks_chunked_empty(self) -> None:
+        """With no ticks the generator produces no chunk at all."""
         db = make_db()
         chunks = list(db.r.ticks_chunked("kalshi:NO-EXISTE"))
         assert chunks == []
@@ -408,7 +408,7 @@ class TestBacktesting:
         assert db.r.count_ticks("kalshi:KXBTC-TEST") == 7
         db.close()
 
-    def test_count_ticks_filtro_temporal(self) -> None:
+    def test_count_ticks_time_filter(self) -> None:
         db = make_db()
         base = datetime(2026, 4, 22, 10, 0, tzinfo=UTC)
         ticks = [make_tick(ts=base + timedelta(hours=i)) for i in range(5)]

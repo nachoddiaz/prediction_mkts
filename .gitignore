@@ -1,0 +1,82 @@
+# ---------------------------------------------------------------------------
+# Secrets — NEVER commit. Use .env.example as the template.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+secrets/
+*.pem
+*.key
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# ---------------------------------------------------------------------------
+# Environments and tooling
+# ---------------------------------------------------------------------------
+.venv/
+venv/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# ---------------------------------------------------------------------------
+# Data — the directory layout is preserved through data/.gitignore
+# ---------------------------------------------------------------------------
+*.duckdb
+*.duckdb.wal
+*.parquet
+
+# ---------------------------------------------------------------------------
+# Generated documentation
+# ---------------------------------------------------------------------------
+docs/_build/
+
+# ---------------------------------------------------------------------------
+# Notebooks
+# ---------------------------------------------------------------------------
+.ipynb_checkpoints/
+
+# ---------------------------------------------------------------------------
+# Ingestion run artefacts
+#
+# ingest.log reached 15 MB over two days of ingestion. These files are local
+# state belonging to one particular run: they do not describe the project and
+# must not travel with it.
+# ---------------------------------------------------------------------------
+*.log
+*.log.*
+*.pid
+ingest_status.json
+
+# ---------------------------------------------------------------------------
+# Tool dumps and scratch
+# ---------------------------------------------------------------------------
+repomix-output.md
+scratch/*.db
+
+# The dotted pattern does not match: WSL creates these files with a COLON
+# ("feedback.md:Zone.Identifier"), not a dot.
+*Zone.Identifier
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.DS_Store
+.idea/
+.vscode/
+*.swp

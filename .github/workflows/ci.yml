@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Tests marked `live` make real HTTP requests to Kalshi, Polymarket and
+# Manifold. They never run here: we do not want CI to depend on an external
+# venue's availability, nor a credential loaded by mistake to end up placing a
+# real order. Run them locally with `pytest -m live`.
+env:
+  PYTHONUNBUFFERED: "1"
+  PAPER_TRADING: "true"
+
+jobs:
+  quality:
+    name: Lint · Types · Tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Sync dependencies
+        run: uv sync --frozen --group dev
+
+      - name: Ruff (lint)
+        run: uv run ruff check .
+
+      - name: Ruff (format check)
+        run: uv run ruff format --check .
+
+      - name: Mypy — core in strict mode
+        # features/, strategies/, execution/, normalizer/, backtesting/ and
+        # storage/ are clean under strict and are the modules that decide what
+        # is quoted, at what risk, and what is persisted. They must stay clean.
+        run: uv run mypy features strategies execution normalizer backtesting storage
+
+      - name: Mypy — connectors y entrypoint (informativo)
+        # Deuda conocida y acotada: connectors/ (~63) y main.py (~16). No bloquea
+        # yet; that shrinks in block B3, which rewrites the connectors.
+        continue-on-error: true
+        run: uv run mypy connectors config main.py
+
+      - name: Tests + cobertura
+        run: >
+          uv run pytest -m "not live"
+          --cov --cov-report=term-missing --cov-report=xml
+
+      - name: Publicar cobertura
+        if: matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: warn

@@ -1,23 +1,23 @@
 """
 connectors/manifold.py
 ───────────────────────
-Connector para Manifold Markets — sandbox con play-money (Mana).
+Manifold Markets connector — a play-money (Mana) sandbox.
 
-Por qué Manifold como sandbox:
-  - Sin auth, sin credenciales, sin riesgo financiero
-  - API pública con 500 req/min
-  - Misma estructura de mercados binarios que Kalshi/Polymarket
-  - Permite testear el pipeline completo end-to-end
+Why Manifold as the sandbox:
+  - No auth, no credentials, no financial risk
+  - A public API with 500 req/min
+  - Same binary market structure as Kalshi and Polymarket
+  - Lets the whole pipeline be exercised end to end
 
-Diferencia clave: sin WebSocket nativo.
-  Simulamos streaming con polling periódico cada POLL_INTERVAL segundos.
-  Suficiente para validar que writer, feature store y strategies
-  funcionan correctamente antes de conectar las APIs reales.
+Key difference: no native WebSocket.
+  Streaming is simulated with periodic polling every POLL_INTERVAL seconds.
+  Enough to validate that the writer, feature store and strategies behave
+  correctly before connecting to the real APIs.
 
-Limitaciones:
-  - Liquidez muy baja (play-money)
-  - Sin orderbook real — solo last_price
-  - Sin trades en tiempo real — solo polling de bets
+Limitations:
+  - Very low liquidity (play money)
+  - No real order book — last_price only
+  - No real-time trades — bet polling only
 """
 
 from __future__ import annotations
@@ -51,23 +51,23 @@ from normalizer.schema import (
 log = logging.getLogger(__name__)
 
 MANIFOLD_BASE = "https://api.manifold.markets/v0"
-POLL_INTERVAL = 10  # segundos entre polls
-MARKET_LIMIT = 20  # mercados a fetchar
+POLL_INTERVAL = 10  # seconds between polls
+MARKET_LIMIT = 20  # markets to fetch
 
 
 class ManifoldConnector(BaseConnector):
     """
-    Connector para Manifold Markets (sandbox).
+    Manifold Markets connector (sandbox).
 
-    Por qué polling en lugar de WebSocket:
-      Manifold no tiene WebSocket. El polling cada 10s es suficiente
-      para testear el pipeline — en producción usaríamos Kalshi/Polymarket
-      que sí tienen WebSocket real.
+    Why polling rather than a WebSocket:
+      Manifold has no WebSocket. Polling every 10 s is enough to exercise the
+      pipeline — production uses Kalshi and Polymarket, which do have real
+      streaming feeds.
 
-    Por qué útil a pesar de las limitaciones:
-      Permite correr el sistema completo (connector → writer → features
-      → strategies) en local sin credenciales ni riesgo financiero.
-      Si el sistema funciona con Manifold, funciona con las APIs reales.
+    Why it is useful despite the limitations:
+      It allows the full system to run (connector → writer → features →
+      strategies) locally, with no credentials and no financial risk.
+      If it works against Manifold, it works against the real APIs.
     """
 
     def __init__(
@@ -75,11 +75,14 @@ class ManifoldConnector(BaseConnector):
         on_tick: TickCallback,
         on_snapshot: SnapshotCallback,
         poll_interval: int = POLL_INTERVAL,
+        backfill_max: int = 200,
+        **kwargs: object,
     ) -> None:
-        super().__init__(on_tick, on_snapshot)
+        super().__init__(on_tick, on_snapshot, **kwargs)  # type: ignore[arg-type]
         self._poll_interval = poll_interval
-        # Cache de último precio por market_id para detectar cambios
-        # Si el precio no cambió desde el último poll, no emitimos tick
+        self._backfill_max = backfill_max
+        # Cache of the last price per market_id, to detect changes.
+        # If the price has not moved since the last poll, no tick is emitted.
         self._last_prices: dict[str, float] = {}
 
     def _build_headers(self) -> dict[str, str]:
@@ -88,15 +91,15 @@ class ManifoldConnector(BaseConnector):
 
     async def get_markets(self) -> list[Market]:
         """
-        Fetcha mercados binarios activos de Manifold.
+        Fetch active binary markets from Manifold.
 
-        Manifold devuelve muchos tipos de mercados (múltiple choice,
-        numeric, etc.). Filtramos solo los binarios (YES/NO) que son
-        equivalentes a los contratos binarios de Kalshi/Polymarket.
+        Manifold returns many market types (multiple choice, numeric, and so
+        on). Only the binary YES/NO ones are kept, since those are the ones
+        equivalent to Kalshi's and Polymarket's binary contracts.
 
-        Ordenados por volumen de actividad (most-traded) descendente
-        para priorizar los mercados con más datos — útil para
-        acumular ticks rápidamente para calibración y backtesting.
+        Sorted by trading activity, descending, to prioritise the markets with
+        the most data — useful for accumulating ticks quickly for calibration
+        and backtesting.
         """
         data = await self._get(
             f"{MANIFOLD_BASE}/search-markets",
@@ -112,8 +115,8 @@ class ManifoldConnector(BaseConnector):
         if not data or not isinstance(data, list):
             return []
 
-        # Ordenar por número total de trades (totalBets) descendente
-        # para que los mercados más poblados (más actividad) estén primero.
+        # Sort by total trade count (totalBets) descending so the busiest
+        # markets come first.
         data.sort(key=lambda m: m.get("volume", 0), reverse=True)
 
         markets = []
@@ -130,15 +133,15 @@ class ManifoldConnector(BaseConnector):
 
     async def get_snapshot(self, market_id: str) -> MarketSnapshot | None:
         """
-        Fetcha el estado actual de un mercado de Manifold.
+        Fetch the current state of one Manifold market.
 
-        Manifold no tiene orderbook real — solo probability (mid-price).
-        Construimos un orderbook sintético de un nivel con spread fijo.
+        Manifold has no real order book — only a probability (the mid price),
+        so a one-level synthetic book with a fixed spread is constructed.
 
-        Por qué spread fijo de 0.02:
-          Sin orderbook real no sabemos el spread. 0.02 (2%) es
-          una aproximación conservadora para mercados de play-money.
-          En backtesting esto se marca claramente como sintético.
+        Why a fixed 0.02 spread:
+          With no real book we do not know the spread. 0.02 (2%) is a
+          conservative approximation for a play-money venue. In backtesting
+          this is flagged clearly as synthetic.
         """
         raw_id = market_id.split(":", 1)[-1]
         data = await self._get(f"{MANIFOLD_BASE}/market/{raw_id}")
@@ -170,19 +173,28 @@ class ManifoldConnector(BaseConnector):
 
     async def backfill_market(self, market_id: str) -> None:
         """
-        Descarga las apuestas históricas (bets) de un mercado y las emite como ticks.
-        Esto permite poblar la base de datos DuckDB con historial real
-        inmediatamente al arrancar la aplicación.
+        Download a market's historical bets and emit them as ticks.
+        This seeds DuckDB with real history immediately on startup.
         """
         raw_id = market_id.split(":", 1)[-1]
         log.info("Manifold: backfilling bets for %s...", market_id)
 
-        # Obtener las últimas 1000 apuestas
+        # How many historical bets are pulled per market.
+        #
+        # This was hard-coded at 1000 and was the main source of junk: 31,000 of
+        # the database's 31,100 rows were this backfill, on markets resolving
+        # 117 days out or more. It is now set by backfill_max_ticks (200 by
+        # default), enough to seed the σ_b series without flooding the table.
+        # 0 disables it.
+        if self._backfill_max <= 0:
+            return
+
+        # Fetch the most recent bets
         data = await self._get(
             f"{MANIFOLD_BASE}/bets",
             params={
                 "contractId": raw_id,
-                "limit": 1000,
+                "limit": self._backfill_max,
             },
         )
 
@@ -190,8 +202,8 @@ class ManifoldConnector(BaseConnector):
             log.info("Manifold: no historical bets found for %s", market_id)
             return
 
-        # Las apuestas vienen de más recientes a más antiguas.
-        # Las invertimos para procesarlas cronológicamente.
+        # Bets arrive most recent first, so they are reversed to be processed
+        # chronologically.
         data.reverse()
 
         ticks_emitted = 0
@@ -222,6 +234,11 @@ class ManifoldConnector(BaseConnector):
                     yes_ask=Price(ask),
                     volume=Size(abs(b.get("amount", 0.0))),
                     side=Side.YES if b.get("outcome") == "YES" else Side.NO,
+                    # Manifold's bet id. Without it every re-poll reinserted the
+                    # same trades: the writer had no way to tell a retry from
+                    # two genuine matches in the same millisecond, which here is
+                    # the norm (a `yes` and a `no`).
+                    source_id=b.get("id"),
                 )
 
                 await self._on_tick(tick)
@@ -233,16 +250,16 @@ class ManifoldConnector(BaseConnector):
 
     async def subscribe(self, market_ids: list[str]) -> None:
         """
-        Simula streaming con polling periódico.
+        Simulate streaming with periodic polling.
 
-        Por cada mercado: fetcha el estado actual y lo compara con
-        el último precio conocido. Si cambió, emite un Tick.
+        For each market: fetch the current state and compare it with the last
+        known price. If it moved, emit a Tick.
 
-        Por qué comparar con el último precio:
-          Sin WebSocket no sabemos exactamente cuándo cambió el precio.
-          Emitir un tick solo cuando el precio cambia evita inundar
-          el writer con ticks idénticos — que subirían el storage
-          sin añadir información nueva.
+        Why compare against the last price:
+          Without a WebSocket we do not know exactly when the price changed.
+          Emitting a tick only on movement avoids flooding the writer with
+          identical ticks, which would inflate storage without adding any new
+          information.
         """
         log.info(
             "Manifold: starting polling loop (%ds interval) for %d markets",
@@ -261,7 +278,7 @@ class ManifoldConnector(BaseConnector):
 
     async def _poll_market(self, market_id: str) -> None:
         """
-        Fetcha el estado de un mercado y emite tick si el precio cambió.
+        Fetch a market's state and emit a tick when the price has moved.
         """
         raw_id = market_id.split(":", 1)[-1]
         data = await self._get(f"{MANIFOLD_BASE}/market/{raw_id}")
@@ -270,12 +287,25 @@ class ManifoldConnector(BaseConnector):
             return
 
         prob = float(data.get("probability", 0.0))
+
+        # A resolved market is ALWAYS emitted, even at probability 0 or 1.
+        #
+        # The previous guard (`if prob <= 0 or prob >= 1: return`) discarded
+        # exactly the moment of interest: on resolution Manifold's probability
+        # goes to precisely 0 or 1. The single event calibration needs was the
+        # single one that never got recorded.
+        market = self._raw_to_market(data)
+        if market is not None and market.status == MarketStatus.RESOLVED:
+            await self._on_snapshot(MarketSnapshot(market=market))
+            log.info("Manifold: market resolved %s (prob=%.3f)", market_id, prob)
+            return
+
         if prob <= 0 or prob >= 1:
             return
 
         last = self._last_prices.get(market_id)
 
-        # Emitir tick si el precio cambió más de 0.1% desde el último poll
+        # Emit a tick when the price moved more than 0.1% since the last poll
         if last is None or abs(prob - last) > 0.001:
             self._last_prices[market_id] = prob
 
@@ -312,16 +342,16 @@ class ManifoldConnector(BaseConnector):
 
     def _raw_to_market(self, raw: dict) -> Market | None:
         """
-        Convierte un market raw de Manifold al dominio canónico.
+        Convert a raw Manifold market into the canonical domain.
 
-        Manifold usa slugs como IDs (e.g. "will-btc-hit-150k-2026")
-        en lugar de tickers o condition_ids.
+        Manifold uses slugs as IDs ("will-btc-hit-150k-2026") rather than
+        tickers or condition_ids.
         """
         slug = raw.get("id") or raw.get("slug")
         if not slug:
             return None
 
-        # Fecha de cierre — Manifold usa closeTime en Unix ms
+        # Close date — Manifold uses closeTime in Unix ms
         close_ms = raw.get("closeTime")
         if not close_ms:
             return None
@@ -330,7 +360,7 @@ class ManifoldConnector(BaseConnector):
 
         resolution_date = datetime.fromtimestamp(close_ms / 1000, tz=UTC)
 
-        # Resultado si está resuelto
+        # Outcome, when resolved
         resolved_value: float | None = None
         if raw.get("isResolved"):
             resolution = raw.get("resolution", "")
@@ -359,22 +389,22 @@ class ManifoldConnector(BaseConnector):
         spread: float = 0.02,
     ) -> OrderBook:
         """
-        Construye un orderbook sintético de un nivel desde la probabilidad.
+        Build a one-level synthetic order book from the probability.
 
-        Por qué sintético:
-          Manifold no tiene CLOB. La probability es el mid-price.
-          Construimos bid = prob - spread/2 y ask = prob + spread/2
-          para mantener la invariante del schema (bid < ask).
+        Why synthetic:
+          Manifold has no CLOB; the probability is the mid price. We build
+          bid = prob - spread/2 and ask = prob + spread/2 to preserve the
+          schema invariant (bid < ask).
 
         Args:
-            market_id: MarketId del mercado
-            prob:      probabilidad actual (mid-price)
-            spread:    spread sintético fijo (default 2%)
+            market_id: the market's MarketId
+            prob:      the current probability (mid price)
+            spread:    the fixed synthetic spread (default 2%)
         """
         bid = max(0.001, round(prob - spread / 2, 4))
         ask = min(0.999, round(prob + spread / 2, 4))
 
-        # Garantizar que bid < ask aunque prob esté en los extremos
+        # Guarantee bid < ask even when prob sits at an extreme
         if bid >= ask:
             bid = round(prob - 0.001, 4)
             ask = round(prob + 0.001, 4)

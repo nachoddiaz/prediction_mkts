@@ -1,7 +1,8 @@
 """
 execution/paper/engine.py
 ─────────────────────────
-Motor de emparejamiento y ejecución simulada (paper trading) basado en ticks y snapshots.
+Matching and simulated execution engine (paper trading), driven by ticks and
+snapshots.
 """
 
 from __future__ import annotations
@@ -17,21 +18,21 @@ log = logging.getLogger(__name__)
 
 class PaperExecutionEngine:
     """
-    Simula la ejecución de órdenes limitadas de compra/venta contra eventos reales.
+    Simulates execution of resting limit orders against real market events.
 
-    Heurísticas de ejecución:
-      1. Cruce del libro (Garantizado):
-         - Si nuestra orden de COMPRA está a un precio >= yes_ask del mercado,
-           se ejecuta (alguien vende a nuestro precio o menos).
-         - Si nuestra orden de VENTA está a un precio <= yes_bid del mercado,
-           se ejecuta (alguien compra a nuestro precio o más).
+    Execution heuristics:
+      1. Book crossing (guaranteed):
+         - If our BUY order sits at a price >= the market's yes_ask, it fills
+           (someone is selling at our price or better).
+         - If our SELL order sits at a price <= the market's yes_bid, it fills
+           (someone is buying at our price or better).
 
-      2. Ejecución pasiva por Trades (Probabilístico/Volumen):
-         - Si recibimos un TRADE en el mercado a un precio <= que nuestra orden de COMPRA,
+      2. Passive execution against trades (probabilistic / volume-based):
+         - A market TRADE at a price <= our BUY order simulates a fill.
            simulamos un fill.
-         - Si recibimos un TRADE en el mercado a un precio >= que nuestra orden de VENTA,
+         - A market TRADE at a price >= our SELL order simulates a fill.
            simulamos un fill.
-         - El tamaño del fill se limita al volumen del trade si está disponible y es positivo.
+         - Fill size is capped by the trade volume when it is available and positive.
     """
 
     def __init__(self, account: PaperAccount) -> None:
@@ -43,16 +44,16 @@ class PaperExecutionEngine:
 
     def process_tick(self, tick: Tick) -> list[Order]:
         """
-        Procesa un Tick individual de mercado y simula ejecuciones contra él.
+        Process one market Tick and simulate executions against it.
 
         Returns:
-            Lista de órdenes que sufrieron algún fill en esta llamada.
+            List of orders that received a fill on this call.
         """
         active_orders = self._account.get_active_orders(tick.market_id)
         filled_orders: list[Order] = []
 
         for order in active_orders:
-            # Solo ejecutamos órdenes del outcome YES por simplicidad y alineación con quoters
+            # Only YES orders are executed, for simplicity and to match the quoters
             if order.outcome != Side.YES:
                 continue
 
@@ -60,29 +61,29 @@ class PaperExecutionEngine:
             fill_price = order.price
 
             if order.action == OrderAction.BUY:
-                # 1. Cruce directo con el ask del mercado
+                # 1. Direct crossing against the market ask
                 if tick.yes_ask <= order.price:
                     fill_size = order.remaining_size
-                # 2. Match pasivo con trades del mercado
+                # 2. Passive match against market trades
                 elif tick.tick_type == TickType.TRADE and tick.yes_bid <= order.price:
-                    # Si el tick de trade viene con volumen válido, tomamos como máximo ese volumen
+                    # Where the trade tick carries a valid volume, cap the fill at it
                     if tick.volume > 0:
                         fill_size = Size(min(order.remaining_size, tick.volume))
                     else:
                         fill_size = order.remaining_size
 
             elif order.action == OrderAction.SELL:
-                # 1. Cruce directo con el bid del mercado
+                # 1. Direct crossing against the market bid
                 if tick.yes_bid >= order.price:
                     fill_size = order.remaining_size
-                # 2. Match pasivo con trades del mercado
+                # 2. Passive match against market trades
                 elif tick.tick_type == TickType.TRADE and tick.yes_ask >= order.price:
                     if tick.volume > 0:
                         fill_size = Size(min(order.remaining_size, tick.volume))
                     else:
                         fill_size = order.remaining_size
 
-            # Si hay ejecución, actualizar cuenta
+            # On a fill, update the account
             if fill_size > 0:
                 updated_order = self._account.fill_order(order.order_id, fill_size, fill_price)
                 if updated_order:
@@ -92,20 +93,20 @@ class PaperExecutionEngine:
 
     def process_snapshot(self, snapshot: MarketSnapshot) -> list[Order]:
         """
-        Procesa un snapshot completo de mercado (libro de órdenes).
+        Process a complete market snapshot (order book).
 
-        Actualiza el estado de las órdenes usando la mejor oferta/demanda del libro.
+        Updates order state using the book's best bid and offer.
         """
         filled_orders: list[Order] = []
 
-        # Procesar primero el tick asociado si está presente
+        # Process the attached tick first, when present
         if snapshot.last_tick:
             filled_orders.extend(self.process_tick(snapshot.last_tick))
 
         if not snapshot.orderbook:
             return filled_orders
 
-        # Cruce con la parte superior del orderbook
+        # Crossing against the top of the book
         best_bid = snapshot.orderbook.best_bid
         best_ask = snapshot.orderbook.best_ask
         market_id = snapshot.market.market_id

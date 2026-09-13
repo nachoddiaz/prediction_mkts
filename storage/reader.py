@@ -1,20 +1,19 @@
 """
 storage/reader.py
 ──────────────────
-Infrastructure Layer — acceso de lectura a DuckDB.
+Infrastructure layer — read access to DuckDB.
 
-Por qué un solo archivo con tres secciones:
-  Los sistemas de trading institucionales usan un único objeto de acceso
-  a datos (DataStore, Repository o Reader según la firma) con métodos
-  agrupados por propósito. Separar en múltiples clases obligaría a gestionar
-  múltiples conexiones a la misma DB — ineficiente y propenso a errores de
-  concurrencia. Una sola conexión compartida entre las tres secciones es
-  más simple y más rápido.
+Why one file with three sections:
+  Institutional trading systems use a single access object (DataStore,
+  Repository or Reader depending on the house style) with methods grouped by
+  purpose. Splitting into several classes would mean several connections to
+  the same database — inefficient and prone to concurrency errors. One shared
+  connection across the three sections is simpler and faster.
 
-Tres secciones:
-  1. OPERACIONAL  — queries acotadas para el feature store y execution engine
-  2. ANALÍTICA    — DataFrames completos para research notebooks
-  3. BACKTESTING  — iteración por chunks para históricos largos
+Three sections:
+  1. OPERATIONAL  — bounded queries for the feature store and execution engine
+  2. ANALYTICAL   — full DataFrames for research notebooks
+  3. BACKTESTING  — chunked iteration over long histories
 """
 
 from __future__ import annotations
@@ -22,6 +21,7 @@ from __future__ import annotations
 import os
 from collections.abc import Generator
 from datetime import datetime
+from typing import Any
 
 import duckdb
 import pandas as pd
@@ -29,40 +29,41 @@ import pandas as pd
 
 class MarketDataReader:
     """
-    Acceso de lectura a la base de datos DuckDB.
+    Read access to the DuckDB database.
 
-    Por qué read_only=False si es un reader:
-      DuckDB en modo read_only=True no permite crear vistas temporales,
-      que necesitamos para queries complejas en notebooks. Además,
-      en modo :memory: (tests) la conexión debe ser read_only=False
-      para compartirla con el writer. El nombre Reader indica intención
-      de uso, no restricción técnica.
+    Why read_only=False in a reader:
+      DuckDB in read_only=True mode does not allow temporary views, which
+      complex notebook queries need. In :memory: mode (tests) the connection
+      must also be read_only=False. The Reader name signals intended use, not
+      a technical restriction.
     """
 
     def __init__(self, db_path: str | None = None) -> None:
-        self._db_path = db_path or os.getenv("DUCKDB_PATH", "./data/duckdb/markets.duckdb")
+        self._db_path: str = (
+            db_path if db_path else os.getenv("DUCKDB_PATH", "./data/duckdb/markets.duckdb")
+        )
         self._con = duckdb.connect(self._db_path, read_only=False)
 
     # ══════════════════════════════════════════════════════════════════
-    # SECCIÓN 1 — OPERACIONAL
-    # Queries rápidas y siempre acotadas.
-    # Nunca devuelven más filas de las solicitadas explícitamente.
-    # Usadas en el hot path: feature store y execution engine.
+    # SECTION 1 — OPERATIONAL
+    # Fast, always-bounded queries. They never return more rows than were
+    # explicitly asked for. Used on the hot path: feature store and execution
+    # engine.
     # ══════════════════════════════════════════════════════════════════
 
     def latest_ticks(self, market_id: str, n: int = 100) -> pd.DataFrame:
         """
-        Últimos N ticks de un mercado, del más reciente al más antiguo.
+        Last N ticks of a market, most recent first.
 
-        Por qué ORDER BY DESC + LIMIT en lugar de una ventana:
-          Es la query más eficiente para "dame los últimos N" en DuckDB.
-          El índice idx_ticks_market_ts hace este ORDER BY muy rápido.
+        Why ORDER BY DESC + LIMIT rather than a window function:
+          It is the most efficient way to ask for "the last N" in DuckDB, and
+          the idx_ticks_market_ts index makes this ORDER BY very fast.
 
-        Por qué devolver DESC (más reciente primero):
-          El feature store necesita el mid-price actual (índice 0)
-          y los N anteriores para EWMA. Con DESC, iloc[0] es siempre
-          el más reciente sin necesidad de invertir el DataFrame.
-          Si necesitas ASC para EWMA, llama .sort_values("timestamp").
+        Why return DESC (most recent first):
+          The feature store needs the current mid price (index 0) and the N
+          before it for the EWMA. With DESC, iloc[0] is always the most recent
+          row without reversing the DataFrame. If you need ascending order for
+          the EWMA, call .sort_values("timestamp").
         """
         return self._con.execute(
             """
@@ -78,14 +79,14 @@ class MarketDataReader:
 
     def latest_orderbook(self, market_id: str) -> pd.DataFrame:
         """
-        Snapshot más reciente del orderbook — exactamente una fila.
+        Most recent order book snapshot — exactly one row.
 
-        Por qué LIMIT 1 y no MAX(timestamp):
-          ORDER BY + LIMIT 1 es más eficiente que MAX() porque puede
-          usar el índice directamente. MAX() requiere un full scan.
+        Why LIMIT 1 rather than MAX(timestamp):
+          ORDER BY + LIMIT 1 is faster than MAX() because it can use the index
+          directly and stop at the first row; MAX() requires a full scan.
 
-        Devuelve DataFrame vacío si no hay datos — el caller debe
-        comprobar if not df.empty antes de acceder a iloc[0].
+        Returns an empty DataFrame when there is no data — the caller must
+        check `if not df.empty` before accessing iloc[0].
         """
         return self._con.execute(
             """
@@ -101,9 +102,9 @@ class MarketDataReader:
 
     def latest_features(self, market_id: str) -> pd.DataFrame:
         """
-        Features más recientes — una fila.
-        Usadas por la estrategia GLFT para leer μ̂, OBI y τ
-        en cada ciclo de decisión de quoting.
+        Most recent features — one row.
+        Used by the GLFT strategy to read μ̂, OBI and τ on every
+        quoting decision cycle.
         """
         return self._con.execute(
             """
@@ -119,9 +120,9 @@ class MarketDataReader:
 
     def market(self, market_id: str) -> pd.DataFrame:
         """
-        Metadatos de un mercado específico — una fila o vacío.
-        Usado por el connector para verificar si un mercado ya
-        está en la DB antes de insertarlo por primera vez.
+        Metadata for one market — a single row, or empty.
+        Used by the connector to check whether a market is already in the
+        database before inserting it for the first time.
         """
         return self._con.execute(
             """
@@ -135,14 +136,13 @@ class MarketDataReader:
 
     def open_markets(self, venue: str | None = None) -> pd.DataFrame:
         """
-        Lista de mercados abiertos, con filtro opcional de venue.
+        List of open markets, optionally filtered by venue.
 
-        Por qué ORDER BY resolution_date ASC:
-          El connector procesa primero los mercados que cierran antes
-          — son los más urgentes para el sistema de trading.
+        Why ORDER BY resolution_date ASC:
+          The connector processes the markets closing soonest first — they
+          are the most urgent for the trading system.
 
-        Usado por el connector al arrancar para saber qué mercados
-        debe monitorizar.
+        Used by the connector at startup to know which markets to monitor.
         """
         if venue:
             return self._con.execute(
@@ -167,15 +167,15 @@ class MarketDataReader:
 
     def mid_price_now(self, market_id: str) -> float | None:
         """
-        Mid-price más reciente como float — shortcut para el execution engine.
+        Most recent mid price as a float — a shortcut for the execution engine.
 
-        Por qué devolver float | None en lugar de DataFrame:
-          El execution engine necesita el precio como número para
-          los cálculos del GLFT, no como DataFrame. Evitar la
-          conversión DataFrame → float en cada ciclo de quoting
-          ahorra microsegundos en el hot path.
+        Why float | None rather than a DataFrame:
+          The execution engine needs the price as a number for the GLFT
+          computation, not as a DataFrame. Avoiding the DataFrame → float
+          conversion on every quoting cycle saves microseconds on the hot
+          path.
 
-        Devuelve None si no hay ticks — el caller debe manejar este caso.
+        Returns None when there are no ticks — the caller must handle that.
         """
         row = self._con.execute(
             """
@@ -189,10 +189,10 @@ class MarketDataReader:
         return float(row[0]) if row and row[0] is not None else None
 
     # ══════════════════════════════════════════════════════════════════
-    # SECCIÓN 2 — ANALÍTICA
-    # Queries exploratorias para research notebooks.
-    # Pueden devolver DataFrames grandes — el caller es responsable
-    # de no saturar la memoria en períodos muy largos.
+    # SECTION 2 — ANALYTICAL
+    # Exploratory queries for research notebooks. These can return large
+    # DataFrames — the caller is responsible for not exhausting memory over
+    # very long periods.
     # ══════════════════════════════════════════════════════════════════
 
     def ticks(
@@ -203,20 +203,20 @@ class MarketDataReader:
         tick_type: str | None = None,
     ) -> pd.DataFrame:
         """
-        Serie temporal completa de ticks para un mercado.
+        Complete tick time series for one market.
 
-        Por qué construir la query dinámicamente con condiciones:
-          SQL estático con todos los filtros opcionales como NULL
-          es menos legible y puede ser menos eficiente (el planificador
-          no siempre optimiza IS NULL correctamente). Con condiciones
-          dinámicas la query usa exactamente los índices necesarios.
+        Why the query is built dynamically from conditions:
+          Static SQL with every optional filter as NULL is less readable and
+          can be less efficient (the planner does not always optimise IS NULL
+          correctly). With dynamic conditions the query uses exactly the
+          indexes it needs.
 
-        Por qué ORDER BY ASC aquí y DESC en latest_ticks:
-          El análisis de series temporales siempre va cronológico.
-          pandas, matplotlib y el backtesting engine esperan orden ASC.
+        Why ORDER BY ASC here and DESC in latest_ticks:
+          Time-series analysis always runs chronologically: pandas, matplotlib
+          and the backtesting engine all expect ascending order.
         """
         conditions = ["market_id = ?"]
-        params: list = [market_id]
+        params: list[Any] = [market_id]
 
         if start:
             conditions.append("timestamp >= ?")
@@ -247,13 +247,13 @@ class MarketDataReader:
         end: datetime | None = None,
     ) -> pd.DataFrame:
         """
-        Solo ticks de tipo TRADE (fills reales).
+        TRADE ticks only (real fills).
 
-        Por qué separar trades de quotes:
-          La volatilidad realizada se calcula solo sobre trades — usar
-          quotes introduciría ruido del bid-ask bounce.
-          El adverse selection se calcula sobre trades con su side.
-          Esta separación hace explícita la intención del caller.
+        Why trades are separated from quotes:
+          Realised volatility is computed over trades alone — using
+          quotes would inject bid-ask bounce noise. Adverse selection is
+          computed over trades together with their side, so keeping the two
+          separate makes the caller's intent explicit.
         """
         return self.ticks(market_id, start=start, end=end, tick_type="trade")
 
@@ -264,12 +264,12 @@ class MarketDataReader:
         end: datetime | None = None,
     ) -> pd.DataFrame:
         """
-        Serie temporal de snapshots de orderbook.
-        Sin bids_json/asks_json para mantener el DataFrame manejable
-        — si necesitas el libro completo usa latest_orderbook().
+        Order book snapshot time series.
+        Without bids_json/asks_json, to keep the DataFrame manageable — use
+        latest_orderbook() when the full book is needed.
         """
         conditions = ["market_id = ?"]
-        params: list = [market_id]
+        params: list[Any] = [market_id]
 
         if start:
             conditions.append("timestamp >= ?")
@@ -298,11 +298,11 @@ class MarketDataReader:
     ) -> pd.DataFrame:
         """
         Serie temporal de features.
-        Usado en notebooks para analizar la evolución de OBI,
-        σ_B y μ̂ y para calibrar los modelos del MATH.md.
+        Used in notebooks to analyse how OBI, σ_b and μ̂ evolve, and to
+        calibrate the models in MATH.md.
         """
         conditions = ["market_id = ?"]
-        params: list = [market_id]
+        params: list[Any] = [market_id]
 
         if start:
             conditions.append("timestamp >= ?")
@@ -329,9 +329,9 @@ class MarketDataReader:
         status: str | None = None,
         category: str | None = None,
     ) -> pd.DataFrame:
-        """Lista de mercados con filtros opcionales."""
+        """List of markets with optional filters."""
         conditions: list[str] = []
-        params: list = []
+        params: list[Any] = []
 
         if venue:
             conditions.append("venue = ?")
@@ -357,12 +357,12 @@ class MarketDataReader:
 
     def daily_volume(self, market_id: str) -> pd.DataFrame:
         """
-        Volumen diario de trades.
+        Daily trade volume.
 
-        Por qué GROUP BY date_ en lugar de DATE_TRUNC(timestamp):
-          date_ es una columna generada en el schema SQL que ya
-          contiene DATE(timestamp). Agrupar por una columna existente
-          es más eficiente que aplicar una función en el GROUP BY.
+        Why GROUP BY date_ rather than DATE_TRUNC(timestamp):
+          date_ is a generated column in the SQL schema that already holds
+          DATE(timestamp). Grouping by an existing column is faster than
+          applying a function inside the GROUP BY.
         """
         return self._con.execute(
             """
@@ -384,12 +384,12 @@ class MarketDataReader:
         freq: str = "5 minutes",
     ) -> pd.DataFrame:
         """
-        Spread promedio agregado por ventana temporal.
+        Average spread aggregated into time buckets.
 
-        Por qué time_bucket en lugar de DATE_TRUNC:
-          time_bucket es la función nativa de DuckDB para bucketing
-          temporal con intervalos arbitrarios. Más flexible que
-          DATE_TRUNC que solo soporta granularidades fijas.
+        Why time_bucket rather than DATE_TRUNC:
+          time_bucket is DuckDB's native function for bucketing over
+          arbitrary intervals. More flexible than DATE_TRUNC, which only
+          supports fixed granularities.
 
         freq ejemplos: "1 minute", "5 minutes", "1 hour", "1 day"
         """
@@ -413,18 +413,17 @@ class MarketDataReader:
         start: datetime | None = None,
     ) -> pd.DataFrame:
         """
-        Compara mid-prices entre venues para detectar arbitraje.
+        Compare mid prices across venues to spot arbitrage.
 
-        Por qué JOIN con markets en lugar de filtrar solo por ticks:
-          Los market_ids de Kalshi y Polymarket son completamente
-          distintos para el mismo evento. El JOIN sobre la pregunta
-          permite encontrar mercados equivalentes entre venues sin
-          necesitar un mapeo explícito.
+        Why JOIN against markets rather than filtering on ticks alone:
+          Kalshi and Polymarket market_ids are completely different
+          identifiers for the same event. Joining on the question text finds
+          equivalent markets across venues without a hand-maintained mapping.
 
-        Usado en research/05_arb_opportunities.ipynb.
+        Used in research/05_arb_opportunities.ipynb.
         """
         conditions = ["LOWER(m.question) LIKE ?"]
-        params: list = [f"%{question_fragment.lower()}%"]
+        params: list[Any] = [f"%{question_fragment.lower()}%"]
 
         if start:
             conditions.append("t.timestamp >= ?")
@@ -444,11 +443,11 @@ class MarketDataReader:
 
     def resolved_markets_with_outcome(self) -> pd.DataFrame:
         """
-        Todos los mercados resueltos con su resultado.
+        Every resolved market together with its outcome.
 
-        Usado en notebooks para construir el dataset de calibración
-        del Brier score — necesitas el par (precio histórico, resultado)
-        para evaluar la calibración del mercado.
+        Used in notebooks to build the Brier calibration dataset — it needs
+        the (historical price, outcome) pair to evaluate how well the market
+        was calibrated.
         """
         return self._con.execute(
             """
@@ -462,9 +461,9 @@ class MarketDataReader:
         ).df()
 
     # ══════════════════════════════════════════════════════════════════
-    # SECCIÓN 3 — BACKTESTING
-    # Iteración eficiente sobre series temporales largas.
-    # Streaming por chunks para uso de memoria constante.
+    # SECTION 3 — BACKTESTING
+    # Efficient iteration over long time series.
+    # Chunked streaming, for constant memory use.
     # ══════════════════════════════════════════════════════════════════
 
     def ticks_chunked(
@@ -475,31 +474,31 @@ class MarketDataReader:
         chunk_size: int = 10_000,
     ) -> Generator[pd.DataFrame, None, None]:
         """
-        Iterador sobre ticks en chunks de chunk_size filas.
+        Iterator over ticks in chunks of chunk_size rows.
 
-        Por qué chunks y no un solo DataFrame:
-          6 meses de ticks cada segundo = ~15M filas ≈ 3-5 GB en memoria.
-          Con chunks de 10k filas el uso de memoria es constante
-          independientemente del tamaño del histórico.
+        Why chunks and not a single DataFrame:
+          Six months of one-second ticks is ~15M rows, 3-5 GB in memory. With
+          10k-row chunks, memory use is constant regardless of how long the
+          history is.
 
-        Por qué fetchmany en lugar de fetchall:
-          fetchmany() es el método de streaming de DuckDB — devuelve
-          N filas sin cargar el resultado completo en memoria.
-          fetchall() cargaría todo el resultado antes de devolver nada.
+        Why fetchmany rather than fetchall:
+          fetchmany() is DuckDB's streaming method — it returns N rows without
+          loading the full result into memory. fetchall() would load the whole
+          result before returning anything.
 
-        Por qué construir DataFrame aquí en lugar de devolver tuples:
-          El backtesting engine y los notebooks esperan DataFrames
-          con columnas nombradas. Construirlo aquí con los nombres
-          correctos evita que cada caller tenga que hacerlo.
+        Why the DataFrame is built here rather than returning tuples:
+          The backtesting engine and the notebooks expect DataFrames with
+          named columns. Building it here with the right names saves every
+          caller from doing it.
 
-        Uso típico:
+        Typical use:
             total = reader.count_ticks(market_id)
             for i, chunk in enumerate(reader.ticks_chunked(market_id)):
                 progress = i * chunk_size / total
                 strategy.on_batch(chunk)
         """
         conditions = ["market_id = ?"]
-        params: list = [market_id]
+        params: list[Any] = [market_id]
 
         if start:
             conditions.append("timestamp >= ?")
@@ -536,15 +535,15 @@ class MarketDataReader:
         chunk_size: int = 5_000,
     ) -> Generator[pd.DataFrame, None, None]:
         """
-        Iterador sobre snapshots de orderbook en chunks.
+        Iterator over order book snapshots, in chunks.
 
-        Por qué chunk_size=5_000 en lugar de 10_000:
-          Los orderbooks incluyen bids_json y asks_json que pueden
-          ser strings de varios KB. Con 10k filas podríamos tener
-          chunks de varios cientos de MB. 5k es más conservador.
+        Why chunk_size=5_000 rather than 10_000:
+          Order books carry bids_json and asks_json, which can be strings of
+          several KB. At 10k rows a chunk could reach several hundred MB; 5k
+          is more conservative.
         """
         conditions = ["market_id = ?"]
-        params: list = [market_id]
+        params: list[Any] = [market_id]
 
         if start:
             conditions.append("timestamp >= ?")
@@ -580,15 +579,15 @@ class MarketDataReader:
         end: datetime | None = None,
     ) -> int:
         """
-        Cuenta total de ticks en un rango.
+        Total number of ticks in a range.
 
-        Por qué COUNT antes de iterar:
-          Permite calcular el progreso del backtesting (chunk N de M)
-          sin necesidad de cargar todos los datos primero.
-          Es una query muy barata — DuckDB usa estadísticas del índice.
+        Why COUNT before iterating:
+          It lets the backtester report progress (chunk N of M) without
+          loading the data first. The query is very cheap — DuckDB uses index
+          statistics.
         """
         conditions = ["market_id = ?"]
-        params: list = [market_id]
+        params: list[Any] = [market_id]
 
         if start:
             conditions.append("timestamp >= ?")

@@ -1,20 +1,20 @@
 """
 connectors/polymarket.py
 ─────────────────────────
-Connector para Polymarket — venue on-chain sobre Polygon.
+Polymarket connector — an on-chain venue on Polygon.
 
 Dos APIs:
-  Gamma API  → metadatos de mercados (sin auth)
-  CLOB API   → orderbook y trades en tiempo real (sin auth para lectura)
+  Gamma API  → market metadata (no auth)
+  CLOB API   → order book and trades in real time (no auth for reads)
 
 WebSocket:
   CLOB WS → price_change events y trade events
-  Sin auth para suscribirse a eventos de precio.
+  No auth required to subscribe to price events.
 
-Por qué no tenemos orderbook completo sin auth:
-  El endpoint /book del CLOB requiere autenticación EIP-712.
-  Para lectura usamos /midpoint y /price como fallback.
-  El orderbook completo estará disponible en Fase 4 con credenciales.
+Why the full order book is available without auth:
+  The book is read from /book, which is public — only order submission
+  requires an EIP-712 signature. Trading endpoints arrive in Phase 4, with
+  credentials.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import websockets
@@ -34,17 +35,15 @@ from connectors.base import (
 from normalizer.polymarket_adapter import (
     _parse_clob_token_ids,
     polymarket_market_to_domain,
+    polymarket_merged_book_to_domain,
     polymarket_price_update_to_tick,
     polymarket_quote_to_tick,
     polymarket_trade_to_tick,
 )
+from normalizer.price_grid import parse_polymarket_tick_size
 from normalizer.schema import (
     Market,
     MarketSnapshot,
-    OrderBook,
-    OrderBookLevel,
-    Price,
-    Size,
 )
 
 log = logging.getLogger(__name__)
@@ -58,39 +57,41 @@ MARKET_FETCH_LIMIT = 50
 
 class PolymarketConnector(BaseConnector):
     """
-    Connector para Polymarket.
+    Polymarket connector.
 
     Diferencia clave respecto a Kalshi:
-      No hay auth para lectura — ningún header especial necesario.
-      Los token IDs (clobTokenIds) son necesarios para el WebSocket —
-      son los identificadores on-chain del token YES de cada mercado.
+      Reads require no auth — no special headers needed.
+      The token IDs (clobTokenIds) are needed for the WebSocket — they are
+      the on-chain identifiers of each market's YES token.
     """
 
     def __init__(
         self,
         on_tick: TickCallback,
         on_snapshot: SnapshotCallback,
+        **kwargs: object,
     ) -> None:
-        super().__init__(on_tick, on_snapshot)
-        # Cache: market_id canónico → yes_token_id
-        # Necesario para construir snapshots desde eventos del WS
-        # que solo contienen el token_id, no el market_id canónico
+        super().__init__(on_tick, on_snapshot, **kwargs)  # type: ignore[arg-type]
+        # Cache: canonical market_id → yes_token_id
+        # Needed to build snapshots from WS events, which carry only the
+        # token_id rather than the canonical market_id
         self._token_to_market: dict[str, str] = {}
+        self._market_tokens: dict[str, tuple[str, str]] = {}
         self._markets_cache: dict[str, Market] = {}
 
     def _build_headers(self) -> dict[str, str]:
-        """Polymarket no requiere auth para lectura."""
+        """Polymarket requires no auth for reads."""
         return {"Accept": "application/json"}
 
     async def get_markets(self) -> list[Market]:
         """
-        Fetcha mercados activos desde la Gamma API.
+        Fetch active markets from the Gamma API.
 
-        Por qué ordenar por volume24hr:
-          Los mercados con más volumen son los más líquidos y los
-          más interesantes para el sistema de trading. Fetchar los
-          top N por volumen garantiza que trabajamos con mercados
-          donde el spread óptimo tiene sentido.
+        Why order by volume24hr:
+          The highest-volume markets are the most liquid and the most
+          interesting for a trading system. Fetching the top N by volume
+          guarantees we work with markets that actually have flow.
+          These are the markets where an optimal spread is meaningful.
         """
         url = f"{GAMMA_BASE}/markets"
         data = await self._get(
@@ -111,7 +112,7 @@ class PolymarketConnector(BaseConnector):
 
         for raw in raw_markets:
             try:
-                # Inferir tags si vienen vacíos (bug conocido de la Gamma API)
+                # Infer tags where they arrive empty (a known Gamma API bug)
                 tags = raw.get("tags", [])
                 if not tags:
                     tags = self._infer_tags(raw.get("question", ""))
@@ -123,8 +124,11 @@ class PolymarketConnector(BaseConnector):
                 # Guardar en cache: token_id → market_id
                 token_ids = _parse_clob_token_ids(raw)
                 if token_ids:
-                    yes_id, _ = token_ids
+                    yes_id, no_id = token_ids
                     self._token_to_market[yes_id] = str(market.market_id)
+                    # The NO token is needed too: its book holds the other
+                    # half of the YES liquidity (see merged_book_to_domain).
+                    self._market_tokens[str(market.market_id)] = (yes_id, no_id)
                     self._markets_cache[str(market.market_id)] = market
 
             except Exception as e:
@@ -135,67 +139,68 @@ class PolymarketConnector(BaseConnector):
 
     async def get_snapshot(self, market_id: str) -> MarketSnapshot | None:
         """
-        Fetcha el estado actual de un mercado de Polymarket.
+        Fetch a Polymarket market's full book from /book.
 
-        Por qué usar /midpoint y /price en lugar de /book:
-          /book requiere auth EIP-712.
-          /midpoint y /price son endpoints públicos que nos dan
-          el mid, bid y ask sin credenciales.
-          Suficiente para el snapshot inicial — el orderbook completo
-          llegará por el WebSocket.
+        Why /book rather than /midpoint + /price:
+          The previous comment claimed /book "requires EIP-712 auth". That is
+          false: it returns HTTP 200 without credentials (verified). What does
+          require a signature is SUBMITTING orders, not reading the book.
+
+          The consequence of not using it was serious. /midpoint and /price
+          return a single price per side and no size, so the snapshot was
+          built with `Size(0.0)`: bid_depth_5 and ask_depth_5 came out 0, and
+          with them OBI, the principal component of μ̂. In other words,
+          Cartea-Jaimungal degenerated to GLFT on Polymarket because of a
+          limitation that did not exist. /book returns the full depth — 153
+          levels in the first market checked — with a price and size per level.
+
+        A note on ordering: /book returns bids ASCENDING and asks DESCENDING,
+        i.e. both sides with the best price LAST. Nothing is assumed here:
+        polymarket_orderbook_to_domain() re-sorts by price.
         """
         market = self._markets_cache.get(market_id)
         if not market:
             return None
 
-        # Buscar el yes_token_id para este market_id
-        yes_token = None
-        for token, mid in self._token_to_market.items():
-            if mid == market_id:
-                yes_token = token
-                break
-
-        if not yes_token:
+        tokens = self._market_tokens.get(market_id)
+        if not tokens:
             return None
+        yes_token, no_token = tokens
 
-        # Fetchear mid, bid y ask en paralelo
-        mid_url = f"{CLOB_BASE}/midpoint?token_id={yes_token}"
-        buy_url = f"{CLOB_BASE}/price?token_id={yes_token}&side=BUY"
-        sell_url = f"{CLOB_BASE}/price?token_id={yes_token}&side=SELL"
-
-        mid_data, buy_data, sell_data = await asyncio.gather(
-            self._get(mid_url),
-            self._get(buy_url),
-            self._get(sell_url),
+        # Both books in parallel: the NO book supplies the YES liquidity that
+        # does not appear in the YES book (see polymarket_merged_book_to_domain).
+        yes_book, no_book = await asyncio.gather(
+            self._get(f"{CLOB_BASE}/book", params={"token_id": yes_token}),
+            self._get(f"{CLOB_BASE}/book", params={"token_id": no_token}),
             return_exceptions=True,
         )
 
-        if not (mid_data and buy_data and sell_data):
+        if not isinstance(yes_book, dict):
             return None
-        if any(isinstance(d, Exception) for d in (mid_data, buy_data, sell_data)):
-            return None
+        book_data = yes_book
 
         try:
-            # BUY price = best ask, SELL price = best bid
-            best_ask = float(buy_data["price"])
-            best_bid = float(sell_data["price"])
-
-            # Corregir si están invertidos (puede ocurrir en mercados extremos)
-            if best_bid >= best_ask:
-                mid = float(mid_data["mid"])
-                best_bid = mid - 0.001
-                best_ask = mid + 0.001
-
-            ob = OrderBook(
-                market_id=market.market_id,
-                timestamp=datetime.now(tz=UTC),
-                bids=(OrderBookLevel(Price(round(best_bid, 6)), Size(0.0)),),
-                asks=(OrderBookLevel(Price(round(best_ask, 6)), Size(0.0)),),
+            ob = polymarket_merged_book_to_domain(
+                market.market_id,
+                yes_book,
+                no_book if isinstance(no_book, dict) else None,
+                datetime.now(tz=UTC),
             )
+            if ob.best_bid is None or ob.best_ask is None:
+                # One-sided book: there is no mid to record.
+                return None
+
             tick = polymarket_quote_to_tick(market.market_id, ob)
 
+            # /book itself publishes the market's tick size, and it is more
+            # reliable than Gamma's metadata because it comes from the engine.
+            ladder = parse_polymarket_tick_size(book_data.get("tick_size")) or market.price_ladder
+            market_with_grid = (
+                market if ladder is market.price_ladder else replace(market, price_ladder=ladder)
+            )
+
             return MarketSnapshot(
-                market=market,
+                market=market_with_grid,
                 orderbook=ob,
                 last_tick=tick,
             )
@@ -206,18 +211,18 @@ class PolymarketConnector(BaseConnector):
 
     async def subscribe(self, market_ids: list[str]) -> None:
         """
-        Se suscribe al WebSocket del CLOB de Polymarket.
+        Subscribe to Polymarket's CLOB WebSocket.
 
-        El WS del CLOB usa token_ids (on-chain), no market_ids canónicos.
-        Por eso necesitamos el cache _token_to_market construido en
-        get_markets().
+        The CLOB WS uses on-chain token_ids, not canonical market_ids.
+        That is why the _token_to_market cache built in get_markets() is
+        needed.
 
-        Tipos de mensaje:
-          price_change → Tick QUOTE
-          trade        → Tick TRADE
-          book         → OrderBook completo (si hay auth)
+        Message types:
+          price_change → QUOTE Tick
+          trade        → TRADE Tick
+          book         → full OrderBook
         """
-        # Obtener los yes_token_ids para los markets que queremos
+        # Collect the yes_token_ids for the markets we want
         token_ids = [token for token, mid in self._token_to_market.items() if mid in market_ids]
 
         if not token_ids:
@@ -225,7 +230,7 @@ class PolymarketConnector(BaseConnector):
             return
 
         async with websockets.connect(CLOB_WS) as ws:
-            # Suscribirse a todos los token_ids
+            # Subscribe to every token_id
             await ws.send(
                 json.dumps(
                     {
@@ -250,11 +255,11 @@ class PolymarketConnector(BaseConnector):
 
     async def _handle_ws_event(self, event: dict) -> None:
         """
-        Procesa un evento del WebSocket del CLOB.
+        Handle one CLOB WebSocket event.
 
         event_type:
-          price_change → Tick QUOTE desde polymarket_price_update_to_tick
-          trade        → Tick TRADE desde polymarket_trade_to_tick
+          price_change → QUOTE Tick via polymarket_price_update_to_tick
+          trade        → TRADE Tick via polymarket_trade_to_tick
         """
         event_type = event.get("event_type") or event.get("type", "")
         asset_id = event.get("asset_id", "")
@@ -279,9 +284,9 @@ class PolymarketConnector(BaseConnector):
     @staticmethod
     def _infer_tags(question: str) -> list[str]:
         """
-        Infiere tags desde la pregunta cuando la API devuelve tags vacíos.
-        Ver polymarket_adapter.py para la misma lógica — duplicada aquí
-        para no importar desde el adapter en el connector.
+        Infer tags from the question when the API returns none.
+        See polymarket_adapter.py for the same logic — duplicated here to
+        avoid importing from the adapter inside the connector.
         """
         q = question.lower()
         if any(w in q for w in ["bitcoin", "btc", "eth", "crypto", "sol"]):

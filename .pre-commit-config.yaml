@@ -1,6 +1,16 @@
+# Local guard rails. Install once with:
+#   .venv/bin/pre-commit install
+#
+# These run before every commit. The security hooks matter most: this repository
+# handles exchange credentials, and a secret that reaches a public remote must be
+# treated as compromised even after it is deleted — the history keeps it.
+
 repos:
+  # Pinned to the same ruff the project depends on. A stale pin here enforces
+  # a different rule set from `ruff check .` — v0.5.0 still had ANN101, removed
+  # from modern ruff, so the hook failed on 215 lines that pass locally.
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.5.0
+    rev: v0.15.11
     hooks:
       - id: ruff
         args: [--fix]
@@ -9,9 +19,47 @@ repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0
     hooks:
+      # --- Security ---
+      # Blocks PEM private keys reaching a commit. The Kalshi RSA key lives in
+      # secrets/, which .gitignore covers, but the hook catches a key pasted
+      # anywhere else by mistake.
+      - id: detect-private-key
+
+      # Refuses .env and other files that should never be versioned. .gitignore
+      # is not enough on its own: `git add -f` bypasses it silently.
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+
+      # --- Correctness ---
       - id: check-yaml
       - id: check-toml
+      - id: check-json
+      - id: check-merge-conflict
+      - id: check-case-conflict
       - id: end-of-file-fixer
       - id: trailing-whitespace
-      - id: check-merge-conflict
-      - id: detect-private-key
+      - id: mixed-line-ending
+        args: [--fix=lf]
+
+  # Full secret scan: API keys, tokens, connection strings and high-entropy
+  # strings that detect-private-key does not recognise. Scans the diff on each
+  # commit, so a leak is stopped before it exists rather than after.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.4
+    hooks:
+      - id: gitleaks
+
+  # Blocks committing an .env file outright. Belt and braces alongside
+  # .gitignore, because the cost of a mistake here is asymmetric.
+  - repo: local
+    hooks:
+      - id: no-dotenv
+        name: refuse to commit .env
+        # --diff-filter=d excludes DELETIONS: removing a previously committed
+        # .env from the index is exactly the fix this hook exists to encourage,
+        # and blocking it makes the repository impossible to clean up.
+        entry: >-
+          bash -c 'if git diff --cached --name-only --diff-filter=d | grep -qE "^\.env$|^\.env\.[^e]"; then
+          echo "ERROR: .env is staged. Use .env.example for the template."; exit 1; fi'
+        language: system
+        pass_filenames: false

@@ -143,7 +143,7 @@ class TestOrderBookImbalance:
         ob = make_ob(bids=[(0.45, 1000)], asks=[(0.47, 1)])
         assert -1.0 <= order_book_imbalance(ob) <= 1.0
 
-    def test_libro_vacio_cero(self) -> None:
+    def test_empty_book_is_zero(self) -> None:
         ob = OrderBook(
             market_id=MarketId(Venue.KALSHI, "KXBTC-TEST"),
             timestamp=datetime.now(tz=UTC),
@@ -158,7 +158,7 @@ class TestSpreads:
         ob = make_ob(bids=[(0.44, 100)], asks=[(0.46, 100)])
         assert quoted_spread(ob) == pytest.approx(0.02)
 
-    def test_quoted_spread_none_si_vacio(self) -> None:
+    def test_quoted_spread_none_when_empty(self) -> None:
         ob = OrderBook(
             market_id=MarketId(Venue.KALSHI, "KXBTC-TEST"),
             timestamp=datetime.now(tz=UTC),
@@ -171,12 +171,12 @@ class TestSpreads:
         ob = make_ob(bids=[(0.44, 100)], asks=[(0.46, 100)])
         assert relative_spread(ob) == pytest.approx(0.02 / 0.45, rel=1e-4)
 
-    def test_relative_spread_mercado_iliquido(self) -> None:
-        """Mercado al 5% con spread 2% tiene relative spread ~40%."""
+    def test_relative_spread_illiquid_market(self) -> None:
+        """A market at 5% with a 2% spread has a relative spread of ~40%."""
         ob = make_ob(bids=[(0.04, 100)], asks=[(0.06, 100)])
         assert relative_spread(ob) == pytest.approx(0.02 / 0.05, rel=1e-4)
 
-    def test_relative_spread_none_si_vacio(self) -> None:
+    def test_relative_spread_none_when_empty(self) -> None:
         ob = OrderBook(
             market_id=MarketId(Venue.KALSHI, "KXBTC-TEST"),
             timestamp=datetime.now(tz=UTC),
@@ -186,10 +186,10 @@ class TestSpreads:
         assert relative_spread(ob) is None
 
 
-# ELIMINADO: TestBernoulliVol — función obsoleta según MATH.md v2.1
-# La volatilidad ahora se calcula desde variación cuadrática de logit(p)
-# usando belief_vol_from_ticks(), no analíticamente desde p y τ.
-# Ver tests de belief_vol_from_ticks más abajo (si existen).
+# REMOVED: TestBernoulliVol — obsolete under MATH.md v2.1.
+# Volatility is now computed from the quadratic variation of logit(p) via
+# belief_vol_from_ticks(), not analytically from p and τ.
+# See the belief_vol_from_ticks tests further down.
 
 
 # ---------------------------------------------------------------------------
@@ -198,26 +198,26 @@ class TestSpreads:
 
 
 class TestEWMAVol:
-    def test_menos_de_2_ticks(self) -> None:
+    def test_fewer_than_two_ticks(self) -> None:
         df = make_ticks_df([0.45])
         assert ewma_vol(df) == 0.0
 
-    def test_precio_constante_vol_cero(self) -> None:
+    def test_constant_price_gives_zero_vol(self) -> None:
         df = make_ticks_df([0.45] * 20)
         assert ewma_vol(df) == pytest.approx(0.0, abs=1e-10)
 
-    def test_mayor_variacion_mayor_vol(self) -> None:
+    def test_larger_moves_raise_vol(self) -> None:
         low = make_ticks_df([0.450, 0.451, 0.450, 0.451] * 5)
         high = make_ticks_df([0.430, 0.470, 0.430, 0.470] * 5)
         assert ewma_vol(high) > ewma_vol(low)
 
-    def test_devuelve_float_no_negativo(self) -> None:
+    def test_returns_non_negative_float(self) -> None:
         df = make_ticks_df([0.40, 0.42, 0.41, 0.43, 0.44])
         vol = ewma_vol(df)
         assert isinstance(vol, float)
         assert vol >= 0.0
 
-    def test_series_longitud_correcta(self) -> None:
+    def test_series_has_correct_length(self) -> None:
         df = make_ticks_df([0.40, 0.42, 0.41, 0.43, 0.44])
         s = ewma_vol_series(df)
         assert len(s) == len(df)
@@ -227,38 +227,38 @@ class TestEWMAVol:
         s = ewma_vol_series(df)
         assert math.isnan(s.iloc[0])
 
-    def test_series_resto_no_nan(self) -> None:
+    def test_series_remainder_is_not_nan(self) -> None:
         df = make_ticks_df([0.40, 0.42, 0.41, 0.43])
         s = ewma_vol_series(df)
         assert not s.iloc[1:].isna().any()
 
 
 class TestOBISeries:
-    def test_todos_yes_positivo(self) -> None:
+    def test_all_yes_side_is_positive(self) -> None:
         df = pd.DataFrame({"side": ["yes"] * 10})
         assert (obi_series(df) > 0).all()
 
-    def test_todos_no_negativo(self) -> None:
+    def test_all_no_side_is_negative(self) -> None:
         df = pd.DataFrame({"side": ["no"] * 10})
         assert (obi_series(df) < 0).all()
 
-    def test_equilibrado_cero(self) -> None:
+    def test_balanced_book_is_zero(self) -> None:
         df = pd.DataFrame({"side": ["yes", "no"] * 5})
         s = obi_series(df, window=10)
         assert s.iloc[-1] == pytest.approx(0.0)
 
-    def test_sin_columna_side(self) -> None:
+    def test_without_side_column(self) -> None:
         df = make_ticks_df([0.45] * 5)
         assert (obi_series(df) == 0.0).all()
 
 
 class TestSpreadTimeseries:
-    def test_spread_correcto(self) -> None:
+    def test_spread_is_correct(self) -> None:
         df = pd.DataFrame({"yes_bid": [0.44, 0.43], "yes_ask": [0.46, 0.45]})
         s = spread_timeseries_from_df(df)
         assert list(s) == pytest.approx([0.02, 0.02])
 
-    def test_sin_columnas_raises(self) -> None:
+    def test_missing_columns_raises(self) -> None:
         with pytest.raises(ValueError):
             spread_timeseries_from_df(pd.DataFrame({"mid": [0.45]}))
 
@@ -313,7 +313,7 @@ class TestComputeFeaturesFromDB:
             ]
         )
 
-    def test_devuelve_dict(self) -> None:
+    def test_returns_dict(self) -> None:
         db = DB()
         self._populate(db)
         result = compute_features_from_db("kalshi:KXBTC-TEST", db.r, 0.19)
@@ -341,7 +341,7 @@ class TestComputeFeaturesFromDB:
         assert required.issubset(result.keys())
         db.close()
 
-    def test_obi_positivo_con_libro_sesgado(self) -> None:
+    def test_obi_positive_on_skewed_book(self) -> None:
         """bid_depth=500 > ask_depth=200 → OBI > 0."""
         db = DB()
         self._populate(db)
@@ -350,8 +350,8 @@ class TestComputeFeaturesFromDB:
         assert result["obi"] > 0
         db.close()
 
-    def test_belief_vol_positivo(self) -> None:
-        """belief_vol debe ser > 0 si hay suficientes ticks."""
+    def test_belief_vol_is_positive(self) -> None:
+        """belief_vol must be > 0 when there are enough ticks."""
         db = DB()
         self._populate(db)
         r1 = compute_features_from_db("kalshi:KXBTC-TEST", db.r, tau_years=1.0)
@@ -359,7 +359,7 @@ class TestComputeFeaturesFromDB:
         assert r1["belief_vol"] > 0.0
         db.close()
 
-    def test_none_si_sin_datos(self) -> None:
+    def test_none_when_no_data(self) -> None:
         db = DB()
         result = compute_features_from_db("kalshi:NO-EXISTE", db.r, 0.5)
         assert result is None
@@ -374,7 +374,7 @@ class TestComputeFeaturesFromDB:
         assert result["tau_years"] == pytest.approx(tau, rel=1e-4)
         db.close()
 
-    def test_venue_correcto(self) -> None:
+    def test_venue_is_correct(self) -> None:
         db = DB()
         self._populate(db)
         result = compute_features_from_db("kalshi:KXBTC-TEST", db.r, 0.19)
@@ -382,7 +382,7 @@ class TestComputeFeaturesFromDB:
         assert result["venue"] == "kalshi"
         db.close()
 
-    def test_batch_excluye_sin_datos(self) -> None:
+    def test_batch_excludes_markets_without_data(self) -> None:
         db = DB()
         self._populate(db)
         tau_map = {"kalshi:KXBTC-TEST": 0.19, "kalshi:NO-EXISTE": 0.5}

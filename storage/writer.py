@@ -1,30 +1,32 @@
 """
 storage/writer.py
 ──────────────────
-Infrastructure Layer — persiste objetos del dominio en DuckDB
-usando un buffer asíncrono con flush periódico.
+Infrastructure layer — persists domain objects into DuckDB through an
+asynchronous buffer with periodic flushing.
 
-Por qué esta arquitectura:
-  El connector produce ticks a velocidad variable e impredecible
-  (ráfagas del WebSocket). DuckDB es más eficiente con batch inserts
-  que con inserts individuales. El buffer desacopla ambas velocidades:
-  el connector encola en O(1) siempre, y el writer escribe en batch
-  cuando el buffer está lleno o ha pasado suficiente tiempo.
+Why this architecture:
+  The connector produces ticks at a variable, unpredictable rate (WebSocket
+  bursts). DuckDB is far more efficient with batch inserts than with
+  individual ones. The buffer decouples the two rates: the connector enqueues
+  in O(1) always, and the writer writes in batches when the buffer is full or
+  enough time has passed.
 
-Dos condiciones de flush (la que ocurra primero):
-  - Tiempo:  cada FLUSH_INTERVAL_SECONDS segundos
-  - Tamaño:  cuando el buffer acumula FLUSH_MAX_ITEMS items
+Two flush conditions, whichever fires first:
+  - Time: every FLUSH_INTERVAL_SECONDS seconds
+  - Size: once the buffer holds FLUSH_MAX_ITEMS items
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import os
 from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import duckdb
 
@@ -41,23 +43,28 @@ log = logging.getLogger(__name__)
 FLUSH_INTERVAL_SECONDS: int = 5
 FLUSH_MAX_ITEMS: int = 1_000
 
+# Maximum time stop() waits for the flush loop before cancelling it.
+# Deliberately bounded: stop() is invoked from __aexit__ and from the signal
+# handler, and a stuck loop must not block shutdown or hang the test suite.
+STOP_TIMEOUT_SECONDS: float = 10.0
+
 
 _QueueItem = Tick | OrderBook | Market
 
 
 class MarketDataWriter:
     """
-    Writer asíncrono con buffer en memoria para DuckDB.
+    Asynchronous writer with an in-memory buffer for DuckDB.
 
-    Dos modos de uso:
+    Two usage modes:
 
-    PRODUCCIÓN — async context manager:
+    PRODUCTION — async context manager:
         async with MarketDataWriter() as writer:
             await writer.enqueue(tick)
             await writer.enqueue(orderbook)
-        # Al salir hace flush final y cierra la conexión
+        # On exit it performs a final flush and closes the connection
 
-    TESTS / SCRIPTS — síncrono directo:
+    TESTS / SCRIPTS — synchronous, direct:
         writer = MarketDataWriter(db_path=":memory:")
         writer.write_ticks_sync([tick1, tick2])
         writer.close()
@@ -68,11 +75,15 @@ class MarketDataWriter:
         db_path: str | None = None,
         flush_interval_seconds: int = FLUSH_INTERVAL_SECONDS,
         flush_max_items: int = FLUSH_MAX_ITEMS,
+        max_db_size_mb: float = 0.0,
+        size_check_every: int = 20,
     ) -> None:
-        self._db_path = db_path or os.getenv("DUCKDB_PATH", "./data/duckdb/markets.duckdb")
+        self._db_path: str = (
+            db_path if db_path else os.getenv("DUCKDB_PATH", "./data/duckdb/markets.duckdb")
+        )
 
-        # Crear directorio si no existe.
-        # :memory: es el modo de tests — no necesita directorio.
+        # Create the directory if it does not exist. ":memory:" is the test
+        # mode and needs none.
         if self._db_path != ":memory:":
             Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
 
@@ -82,58 +93,108 @@ class MarketDataWriter:
         self._flush_interval = flush_interval_seconds
         self._flush_max_items = flush_max_items
 
-        self._queue: asyncio.Queue[_QueueItem | None] = asyncio.Queue()
+        # Size cap. Checked every db_size_check_every flushes rather than on
+        # each one: a stat() per batch is cheap but unnecessary, and 20 flushes
+        # is seconds of latency to react.
+        self._max_bytes = int(max_db_size_mb * 1024 * 1024) if max_db_size_mb > 0 else 0
+        self._size_check_every = max(1, size_check_every)
+        self._size_exceeded = False
 
-        self._flush_task: asyncio.Task | None = None
+        self._queue: asyncio.Queue[_QueueItem] = asyncio.Queue()
 
-        # Estadísticas acumuladas para logging y monitorización.
+        # Stop signal. An asyncio.Event and NOT a poison pill in the queue:
+        # with the pill, flush_now() consumed it while draining, re-queued it
+        # and broke out, leaving items behind; the loop then re-consumed those
+        # items and never reached the None, so stop() waited forever — a
+        # livelock at 100% CPU, reproducible with any exception raised inside
+        # the `async with` block.
+        self._stop_event: asyncio.Event = asyncio.Event()
+
+        self._flush_task: asyncio.Task[None] | None = None
+
+        # Cumulative statistics for logging and monitoring.
         self._stats = {"ticks": 0, "orderbooks": 0, "markets": 0, "flushes": 0}
 
     def _init_schema(self) -> None:
         """
-        Ejecuta la migración SQL inicial si las tablas no existen.
+        Apply every pending migration, in order and exactly once.
 
-        Por qué statement a statement y no todo de una vez:
-            DuckDB no soporta múltiples statements con columnas
-            GENERATED ALWAYS AS en un solo execute(). Las columnas
-            generadas (mid, spread, date_) usan esta sintaxis,
-            así que hay que ejecutar cada CREATE TABLE por separado.
+        Why a runner was needed rather than just executing 001:
+          Previously only `001_initial_schema.sql` ran on each startup, and
+          "already exists" errors were swallowed. That works as long as the
+          schema never changes, but there is no way to apply a new migration
+          to an existing database, nor to know which ones have run. Changing
+          the schema in production was a manual operation.
 
-        Por qué ignorar errores:
-            Si la tabla ya existe DuckDB lanza un error. Lo ignoramos
-            porque usar IF NOT EXISTS no funciona con columnas generadas
-            en todas las versiones de DuckDB.
+        How it works:
+          `schema_migrations` records the name of each applied file. On every
+          startup only the unregistered ones run, ordered by name. That is the
+          minimum needed to make the operation repeatable and auditable.
+
+        Why statement by statement:
+          DuckDB does not accept several statements with GENERATED ALWAYS AS
+          columns in a single execute(), and the base schema uses them (mid,
+          spread, date_).
         """
-        migration_path = Path(__file__).parent / "migrations" / "001_initial_schema.sql"
-        if not migration_path.exists():
-            log.warning("Migration file not found: %s", migration_path)
+        migrations_dir = Path(__file__).parent / "migrations"
+        if not migrations_dir.is_dir():
+            log.warning("Migrations directory not found: %s", migrations_dir)
             return
 
-        sql = migration_path.read_text()
-        statements = [s.strip() for s in sql.split(";") if s.strip()]
-        for stmt in statements:
-            try:
-                self._con.execute(stmt)
-            except duckdb.Error as e:
-                msg = str(e).lower()
-                # Ignorar solo errores de tabla/índice ya existente
-                if "already exists" not in msg:
-                    log.warning("Schema migration warning: %s", e)
+        self._con.execute(
+            """
+            CREATE TABLE IF NOT EXISTS schema_migrations (
+                name       VARCHAR     NOT NULL,
+                applied_at TIMESTAMPTZ NOT NULL
+            )
+            """
+        )
+        applied = {
+            row[0] for row in self._con.execute("SELECT name FROM schema_migrations").fetchall()
+        }
+
+        for path in sorted(migrations_dir.glob("*.sql")):
+            if path.name in applied:
+                continue
+
+            # Comments are stripped BEFORE splitting on ";". Splitting the raw
+            # text breaks any statement whose comment happens to contain a
+            # semicolon, and the resulting fragments only produce a warning —
+            # a schema silently left half-created.
+            sql = "\n".join(
+                line for line in path.read_text().splitlines() if not line.lstrip().startswith("--")
+            )
+            for stmt in (s.strip() for s in sql.split(";")):
+                if not stmt:
+                    continue
+                try:
+                    self._con.execute(stmt)
+                except duckdb.Error as e:
+                    # "already exists" is expected on a pre-existing database
+                    # that never recorded its migrations; anything else is reported.
+                    if "already exists" not in str(e).lower():
+                        log.warning("Migration %s: %s", path.name, e)
+
+            self._con.execute(
+                "INSERT INTO schema_migrations VALUES (?, ?)",
+                [path.name, datetime.now(tz=UTC)],
+            )
+            log.info("Applied migration: %s", path.name)
 
     # ------------------------------------------------------------------
-    # API asíncrona — producción
+    # Asynchronous API — production
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
         """
-        Arranca el loop de flush en background como asyncio Task.
+        Start the flush loop in the background as an asyncio Task.
 
-        Por qué create_task y no directamente await:
-          El flush loop debe correr concurrentemente con el connector
-          que produce ticks. create_task lo lanza en el background
-          sin bloquear. El connector puede seguir encolando mientras
-          el loop escribe en disco.
+        Why create_task and not a direct await:
+          The flush loop must run concurrently with the connector producing
+          ticks. create_task launches it in the background without blocking,
+          so the connector can keep enqueuing while the loop writes to disk.
         """
+        self._stop_event.clear()
         self._flush_task = asyncio.create_task(
             self._flush_loop(),
             name="writer-flush-loop",
@@ -146,37 +207,57 @@ class MarketDataWriter:
 
     async def stop(self) -> None:
         """
-        Para el loop de flush de forma ordenada (graceful shutdown):
-          1. Envía None a la queue — señal de parada para el loop
-          2. Espera a que el loop termine con await
-          3. Hace un flush síncrono final de lo que quede en el buffer
-          4. Cierra la conexión DuckDB
+        Stop the flush loop cleanly (graceful shutdown):
+          1. Set _stop_event — the stop signal for the loop
+          2. Wait for the loop to finish, with a bounded timeout
+          3. Perform a final synchronous flush of whatever remains buffered
+          4. Close the DuckDB connection
 
-        Por qué None como señal de parada:
-          Es el patrón estándar para "poison pill" en colas asíncronas.
-          El loop comprueba si el item es None antes de procesarlo.
-          Así evitamos cancelar la tarea abruptamente, que podría
-          dejar datos sin persistir.
+        Why an Event rather than a poison pill in the queue:
+          The pill travelled down the same channel as the data, so flush_now()
+          could consume it while draining. Re-queuing it and cutting the drain
+          short left items behind, the loop re-consumed them, and the signal
+          never reached its destination: stop() waited indefinitely. An Event
+          lives outside the queue and is idempotent.
+
+        Why the timeout:
+          stop() is called from __aexit__ and from the signal handler. A stuck
+          loop (DuckDB locked, say) must neither block shutdown nor hang the
+          test suite. If the timeout expires we cancel it and persist whatever
+          is left synchronously.
         """
+        self._stop_event.set()
+
         if self._flush_task and not self._flush_task.done():
-            await self._queue.put(None)  # poison pill
-            await self._flush_task
+            try:
+                await asyncio.wait_for(self._flush_task, timeout=STOP_TIMEOUT_SECONDS)
+            except TimeoutError:
+                log.error(
+                    "Flush loop did not stop within %.1fs — cancelling",
+                    STOP_TIMEOUT_SECONDS,
+                )
+                self._flush_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._flush_task
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:  # noqa: BLE001 - the loop already logs the detail
+                log.error("Flush loop raised on shutdown: %s", e)
+
         self._flush_remaining()
         self._con.close()
         log.info("MarketDataWriter stopped — stats: %s", self._stats)
 
     async def enqueue(self, item: _QueueItem) -> None:
         """
-        Encola un item para escritura asíncrona.
-        Siempre O(1) — no bloquea nunca.
+        Enqueue an item for asynchronous writing. Always O(1) — never blocks.
 
-        Por qué forzar flush cuando el buffer está lleno:
-          Sin este control, en un pico de actividad la queue podría
-          crecer sin límite consumiendo toda la memoria disponible.
-          Al detectar que hay flush_max_items esperando, hacemos
-          un flush inmediato antes de encolar el nuevo item.
-          Esto introduce una pequeña latencia en ese momento puntual,
-          pero mantiene el uso de memoria acotado.
+        Why force a flush when the buffer is full:
+          Without this control, a burst of activity could grow the queue
+          without bound and consume all available memory. On detecting
+          flush_max_items waiting, we flush immediately before enqueuing the
+          new item. That adds a little latency at that instant but keeps
+          memory usage bounded.
         """
         if self._queue.qsize() >= self._flush_max_items:
             await self.flush_now()
@@ -185,13 +266,13 @@ class MarketDataWriter:
 
     async def enqueue_snapshot(self, snapshot: MarketSnapshot) -> None:
         """
-        Encola todos los componentes de un MarketSnapshot de una vez.
+        Enqueue every component of a MarketSnapshot at once.
 
-        Por qué este método de conveniencia:
-          El connector fetcha snapshots completos (market + orderbook + tick).
-          Sin este método tendría que hacer tres llamadas a enqueue().
-          Este método garantiza que los tres componentes se encolan
-          en el mismo orden siempre, sin riesgo de olvidar alguno.
+        Why this convenience method:
+          The connector fetches complete snapshots (market + orderbook + tick).
+          Without this method the connector would make three enqueue() calls.
+          This guarantees the three components are always enqueued in the same
+          order, with no risk of forgetting one.
         """
         await self.enqueue(snapshot.market)
         if snapshot.orderbook is not None:
@@ -201,59 +282,58 @@ class MarketDataWriter:
 
     async def _flush_loop(self) -> None:
         """
-        Coroutine que corre en background indefinidamente.
+        Background coroutine that runs until _stop_event is set.
 
-        Lógica del timer con wait_for:
-          Intentamos leer un item de la queue con timeout de
-          flush_interval_seconds. Si llega un item antes del timeout,
-          lo devolvemos a la queue y hacemos flush de todo.
-          Si el timeout expira sin items, también hacemos flush
-          (puede ser un flush vacío — es barato).
+        Timer logic:
+          We wait on _stop_event with a flush_interval_seconds timeout. If the
+          timeout expires → periodic flush. If the event fires → one final
+          flush and exit. Either way exactly one flush happens per iteration,
+          so the last window is never lost.
 
-        Por qué capturar Exception genérica:
-          Un error de escritura en DuckDB (disco lleno, corrupción)
-          no debe matar el loop. Lo logueamos como error y continuamos.
-          Si el loop muriese, perderíamos todos los datos subsiguientes
-          silenciosamente.
+        Why not wait on the queue:
+          `asyncio.wait_for(queue.get(), timeout)` can cancel the getter AFTER
+          it has received an item, losing it. Waiting on an Event removes that
+          race: items are only read in flush_now(), which drains with
+          get_nowait() and cannot lose anything.
+
+        Why catching a bare Exception:
+          A DuckDB write error (disk full, corruption) must not kill the loop.
+          We log it as an error and carry on. If the loop died, every
+          subsequent datum would be lost silently.
         """
         while True:
+            stopping = False
             try:
-                try:
-                    item = await asyncio.wait_for(
-                        self._queue.get(),
-                        timeout=self._flush_interval,
-                    )
-                    if item is None:
-                        # Señal de parada recibida — salir del loop
-                        log.debug("Flush loop received stop signal")
-                        return
-                    # Devolver el item para que _flush_now() lo procese
-                    # junto con los demás que puedan haber llegado
-                    await self._queue.put(item)
-                except TimeoutError:
-                    # Timer expirado — hacer flush de lo que haya (puede ser 0)
-                    pass
+                await asyncio.wait_for(
+                    self._stop_event.wait(),
+                    timeout=self._flush_interval,
+                )
+                stopping = True
+            except TimeoutError:
+                pass  # timer expired — periodic flush
 
+            try:
                 await self.flush_now()
-
             except Exception as e:
                 log.error("Error in flush loop: %s", e, exc_info=True)
 
+            if stopping:
+                log.debug("Flush loop received stop signal")
+                return
+
     async def flush_now(self) -> None:
         """
-        Vacía la queue y escribe todos los items en DuckDB en batch.
+        Drain the queue and write every item into DuckDB as a batch.
 
-        Por qué drenar la queue completa antes de escribir:
-          Queremos un solo executemany por tipo por flush, no un
-          execute por item. Primero clasificamos todos los items
-          por tipo, luego hacemos un insert por tabla.
-          Esto es 10-50x más eficiente que inserts individuales.
+        Why drain the whole queue before writing:
+          We want a single executemany per type per flush, not one execute per
+          item. Items are first classified by type, then inserted one table at
+          a time. This is 10-50x faster than individual inserts.
 
-        Por qué get_nowait en lugar de get:
-          get() bloquea si la queue está vacía. get_nowait() lanza
-          QueueEmpty que capturamos para saber que hemos vaciado todo.
-          Es la forma correcta de drenar una queue asíncrona de forma
-          no bloqueante.
+        Why get_nowait instead of get:
+          get() blocks when the queue is empty. get_nowait() raises QueueEmpty,
+          which we catch to know the queue has been drained. It is the correct
+          way to drain an asyncio queue without blocking.
         """
         ticks: list[Tick] = []
         orderbooks: list[OrderBook] = []
@@ -262,10 +342,6 @@ class MarketDataWriter:
         while not self._queue.empty():
             try:
                 item = self._queue.get_nowait()
-                if item is None:
-                    # Señal de parada encontrada vaciando — reponerla
-                    await self._queue.put(None)
-                    break
                 if isinstance(item, Tick):
                     ticks.append(item)
                 elif isinstance(item, OrderBook):
@@ -275,7 +351,12 @@ class MarketDataWriter:
             except asyncio.QueueEmpty:
                 break
 
-        # Batch insert por tabla — solo si hay datos
+        if self._size_limit_reached():
+            # The batch is dropped on purpose: writing on would fill the disk.
+            # Logged once so it does not flood.
+            return
+
+        # Batch insert per table — only when there is data
         if ticks:
             self._write_ticks_batch(ticks)
             self._stats["ticks"] += len(ticks)
@@ -297,16 +378,56 @@ class MarketDataWriter:
                 len(markets),
             )
 
+    def _size_limit_reached(self) -> bool:
+        """
+        True once the database has exceeded max_db_size_mb.
+
+        Why it exists:
+          Without a cap, unattended ingestion grows until the disk is full and
+          you find out when something else breaks. `ticks` grows with every
+          WebSocket message; in production that is millions of rows per day.
+
+        Behaviour once exceeded: writes stop being accepted and the condition
+        is logged ONCE. Nothing is deleted — deciding what to discard belongs
+        to the archiver (storage/archiver.py), not the writer.
+        """
+        if self._max_bytes <= 0 or self._db_path == ":memory:":
+            return self._size_exceeded
+
+        self._stats["flushes"]
+        if self._stats["flushes"] % self._size_check_every != 0 and not self._size_exceeded:
+            return False
+
+        try:
+            size = Path(self._db_path).stat().st_size
+        except OSError:
+            return False
+
+        if size >= self._max_bytes and not self._size_exceeded:
+            self._size_exceeded = True
+            log.error(
+                "db_size_limit_reached: %.1f MB >= %.1f MB — writes stopped. "
+                "Archive or raise MAX_DB_SIZE_MB to resume.",
+                size / 1024 / 1024,
+                self._max_bytes / 1024 / 1024,
+            )
+        return self._size_exceeded
+
+    @property
+    def size_limit_reached(self) -> bool:
+        """So main.py can report it in the periodic statistics."""
+        return self._size_exceeded
+
     def _flush_remaining(self) -> None:
         """
-        Flush síncrono final — llamado desde stop() después de
-        cancelar el loop async.
+        Final synchronous flush — called from stop() after the async loop has
+        been cancelled.
 
-        Por qué necesitamos esto además del loop:
-          Entre el momento en que el loop recibe el None y el momento
-          en que stop() llama a este método, pueden haber llegado
-          más items a la queue. Este método los persiste antes de cerrar.
-          Es la garantía de que no perdemos datos en el shutdown.
+        Why this is needed in addition to the loop:
+          Between the loop's last flush and the moment stop() calls this, more
+          items may have arrived in the queue — or the loop may have been
+          cancelled on timeout. This method persists them before closing the
+          connection. It is the guarantee that no data is lost on shutdown.
         """
         ticks: list[Tick] = []
         orderbooks: list[OrderBook] = []
@@ -315,8 +436,6 @@ class MarketDataWriter:
         while not self._queue.empty():
             try:
                 item = self._queue.get_nowait()
-                if item is None:
-                    break
                 if isinstance(item, Tick):
                     ticks.append(item)
                 elif isinstance(item, OrderBook):
@@ -335,19 +454,19 @@ class MarketDataWriter:
 
     def _write_ticks_batch(self, ticks: list[Tick]) -> None:
         """
-        Inserta ticks en batch con executemany.
+        Batch-insert ticks with executemany.
 
-        Por qué no incluimos mid, spread y date_:
-          Son columnas GENERATED ALWAYS AS en el schema SQL.
-          DuckDB las calcula automáticamente desde yes_bid, yes_ask
-          y timestamp. Si intentamos insertarlas manualmente, DuckDB
-          lanza un error. La responsabilidad de calcularlas es de la DB,
-          no del writer — esto garantiza consistencia siempre.
+        Why mid, spread and date_ are not included:
+          They are GENERATED ALWAYS AS columns in the SQL schema. DuckDB
+          computes them from yes_bid, yes_ask and timestamp automatically, and
+          inserting them by hand raises an error. Computing them is the
+          database's responsibility rather than the writer's — consistency by
+          construction.
 
-        Por qué usar ? en lugar de :named_params:
-          DuckDB no soporta parámetros nombrados (:param) en executemany.
-          Solo soporta posicionales (?). Los named params solo funcionan
-          en execute() simple, no en batch.
+        Why ? rather than :named_params:
+          DuckDB does not support named parameters (:param) in executemany,
+          only positional ones (?). Named params work in a plain execute(),
+          not in a batch.
         """
         rows = [
             (
@@ -359,34 +478,40 @@ class MarketDataWriter:
                 float(t.yes_ask),
                 float(t.volume),
                 t.side.value if t.side else None,
+                t.source_id,
             )
             for t in ticks
         ]
+        # ON CONFLICT DO NOTHING makes ingestion IDEMPOTENT: a writer retry, or
+        # a connector re-poll returning already-seen trades, does not duplicate
+        # rows. The conflict is detected by ux_ticks_market_source over
+        # (market_id, source_id); quotes carry a NULL source_id, and in SQL two
+        # NULLs do not collide, so they always pass through.
         self._con.executemany(
             """
             INSERT INTO ticks
                 (market_id, venue, timestamp, tick_type,
-                 yes_bid, yes_ask, volume, side)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 yes_bid, yes_ask, volume, side, source_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT DO NOTHING
             """,
             rows,
         )
 
     def _write_orderbooks_batch(self, orderbooks: list[OrderBook]) -> None:
         """
-        Inserta orderbooks en batch.
+        Batch-insert order books.
 
-        Por qué guardar bids_json y asks_json además de best_bid/ask:
-          best_bid y best_ask son para queries analíticas rápidas
-          sin parsear JSON. bids_json y asks_json preservan la
-          profundidad completa del libro — necesaria para reconstruir
-          el orderbook completo en backtesting o para calcular métricas
-          de liquidez más allá del top level.
+        Why bids_json and asks_json are stored alongside best_bid/ask:
+          best_bid and best_ask exist for fast analytical queries that need no
+          JSON parsing, while the JSON columns preserve the full depth —
+          needed to reconstruct the book in backtesting, or to compute
+          liquidity metrics beyond the top level.
 
-        Por qué bid_depth_5 y ask_depth_5 pre-computados:
-          Son las features más consultadas por el feature store.
-          Pre-computarlas en el insert evita parsear el JSON en
-          cada query, a costa de un poco más de espacio en disco.
+        Why bid_depth_5 and ask_depth_5 are precomputed:
+          These are the features the feature store queries most. Computing
+          them at insert time avoids parsing JSON on every read: a little disk
+          traded for a lot of query time.
         """
         rows = [
             (
@@ -416,19 +541,19 @@ class MarketDataWriter:
 
     def _write_markets_batch(self, markets: list[Market]) -> None:
         """
-        Upsert de markets con ON CONFLICT DO UPDATE.
+        Upsert markets with ON CONFLICT DO UPDATE.
 
-        Por qué upsert en lugar de INSERT:
-          El connector redescubre mercados periódicamente para detectar
-          cambios de status (OPEN → RESOLVED). Sin upsert tendríamos
-          filas duplicadas. Con upsert, si el market_id ya existe solo
-          actualizamos los campos que pueden cambiar (status, resolved_value,
-          updated_at), preservando los campos estáticos (question, category).
+        Why upsert rather than INSERT:
+          The connector rediscovers markets periodically to detect status
+          changes (OPEN → RESOLVED). Without an upsert we would accumulate
+          duplicate rows. With one, an existing market_id only has the fields
+          that can change updated (status, resolved_value, updated_at), while
+          the static ones (question, category) are preserved.
 
-        Por qué updated_at se asigna aquí y no en el schema:
-          DuckDB no soporta DEFAULT NOW() con TIMESTAMPTZ de forma
-          consistente entre versiones. Lo asignamos explícitamente
-          en Python para garantizar que es UTC siempre.
+        Why updated_at is set here rather than in the schema:
+          DuckDB does not support DEFAULT NOW() with TIMESTAMPTZ consistently
+          across versions. We assign it explicitly in Python to guarantee it
+          is always UTC.
         """
         now = datetime.now(tz=UTC)
         rows = [
@@ -460,15 +585,15 @@ class MarketDataWriter:
             rows,
         )
 
-    def _write_features_batch(self, rows: list[dict]) -> None:
+    def _write_features_batch(self, rows: list[dict[str, Any]]) -> None:
         """
-        Inserta features pre-computadas en batch.
-        Llamado desde features/store.py, no desde el connector.
+        Batch-insert precomputed features.
+        Called from features/store.py, not from the connector.
 
-        Por qué convertir dicts a tuples antes de executemany:
-          DuckDB no soporta :named_params en executemany (solo en
-          execute simple). Convertimos cada dict a una tuple con
-          el orden correcto de columnas explícitamente.
+        Why dicts are converted to tuples before executemany:
+          DuckDB does not support :named_params in executemany (only in a
+          plain execute()). Each dict is converted to a tuple in the correct
+          column order, explicitly.
         """
         tuples = [
             (
@@ -496,18 +621,18 @@ class MarketDataWriter:
         )
 
     # ------------------------------------------------------------------
-    # API síncrona — tests y scripts
-    # Escribe directamente sin pasar por la queue.
+    # Synchronous API — tests and scripts
+    # Write directly, bypassing the queue.
     # ------------------------------------------------------------------
 
     def write_ticks_sync(self, ticks: Sequence[Tick]) -> int:
         """
-        Escribe ticks síncronamente. Para tests y scripts.
+        Write ticks synchronously. For tests and scripts.
 
-        Por qué no usar enqueue en tests:
-          enqueue requiere un event loop activo. En tests síncronos
-          no hay event loop. Esta API permite testear la lógica de
-          persistencia sin la complejidad del sistema async.
+        Why enqueue is not used in tests:
+          enqueue requires a running event loop, and synchronous tests have
+          none. This API allows the persistence logic to be tested without the
+          complexity of the async machinery.
         """
         if not ticks:
             return 0
@@ -515,15 +640,15 @@ class MarketDataWriter:
         return len(ticks)
 
     def write_orderbook_sync(self, ob: OrderBook) -> None:
-        """Escribe un orderbook síncronamente."""
+        """Write one order book synchronously."""
         self._write_orderbooks_batch([ob])
 
     def write_market_sync(self, market: Market) -> None:
-        """Escribe un market síncronamente (upsert)."""
+        """Write one market synchronously (upsert)."""
         self._write_markets_batch([market])
 
-    def write_features_sync(self, rows: list[dict]) -> int:
-        """Escribe features síncronamente."""
+    def write_features_sync(self, rows: list[dict[str, Any]]) -> int:
+        """Write features synchronously."""
         if not rows:
             return 0
         self._write_features_batch(rows)
@@ -531,8 +656,8 @@ class MarketDataWriter:
 
     def write_snapshot_sync(self, snapshot: MarketSnapshot) -> None:
         """
-        Escribe un MarketSnapshot completo síncronamente.
-        Persiste market, orderbook y tick en una sola llamada.
+        Write a complete MarketSnapshot synchronously.
+        Persists market, order book and tick in a single call.
         """
         self.write_market_sync(snapshot.market)
         if snapshot.orderbook is not None:
@@ -541,20 +666,20 @@ class MarketDataWriter:
             self.write_ticks_sync([snapshot.last_tick])
 
     # ------------------------------------------------------------------
-    # Context managers y housekeeping
+    # Context managers and housekeeping
     # ------------------------------------------------------------------
 
     async def __aenter__(self) -> MarketDataWriter:
-        """Arranca el flush loop al entrar en el context manager."""
+        """Start the flush loop on entering the context manager."""
         await self.start()
         return self
 
     async def __aexit__(self, *_: object) -> None:
-        """Para el flush loop y hace flush final al salir."""
+        """Stop the flush loop and perform a final flush on exit."""
         await self.stop()
 
     def close(self) -> None:
-        """Cierre síncrono de la conexión DuckDB. Para tests."""
+        """Close the DuckDB connection synchronously. For tests."""
         self._con.close()
 
     def __enter__(self) -> MarketDataWriter:
@@ -564,9 +689,9 @@ class MarketDataWriter:
         self.close()
 
     @property
-    def stats(self) -> dict:
+    def stats(self) -> dict[str, int]:
         """
-        Estadísticas de escritura acumuladas desde el arranque.
-        Útil para monitorización y logging periódico.
+        Cumulative write statistics since startup.
+        Useful for monitoring and periodic logging.
         """
         return dict(self._stats)
